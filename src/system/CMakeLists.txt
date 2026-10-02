@@ -115,6 +115,13 @@ if(WIN32)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+if(UNIX AND NOT APPLE)
+    # Atomic helpers on guest structs under #pragma pack: the compiler cannot
+    # prove alignment there and calls the generic libatomic entry points.
+    # PUBLIC so the host, the generator and the guest modules link it too.
+    target_link_libraries(rexruntime PUBLIC atomic)
+endif()
+
 if(REXGLUE_USE_D3D12)
     target_link_libraries(rexruntime PUBLIC dxc-headers)
     target_compile_definitions(rexruntime PUBLIC REX_HAS_D3D12=1)
