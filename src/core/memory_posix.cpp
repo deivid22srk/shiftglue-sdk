@@ -48,6 +48,10 @@
 
 #if REX_PLATFORM_LINUX
 #include <sys/mman.h>  // memfd_create
+#if REX_PLATFORM_ANDROID
+// The memfd_create syscall entry for the API 29- fallback below.
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace rex {
@@ -401,7 +405,18 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   // An anonymous memfd: nothing named outlives a crash (shm_open names stay in
   // /dev/shm), and Android apps have neither /dev/shm nor, since API 29,
   // ashmem. The views decide their own protection.
+#if REX_PLATFORM_ANDROID
+  // The bionic wrapper is only declared from API 30, so go through the
+  // syscall (present since Linux 3.17 on every supported arm64 device).
+  // MFD_CLOEXEC/MFD_ALLOW_SEALING come from the Linux uapi headers.
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+  int fd = static_cast<int>(
+      syscall(SYS_memfd_create, path.filename().c_str(), MFD_CLOEXEC));
+#else
   int fd = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
+#endif
   if (fd < 0) {
     return kFileMappingHandleInvalid;
   }

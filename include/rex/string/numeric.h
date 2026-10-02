@@ -26,8 +26,16 @@
 #include <rex/string/utf8.h>
 #include <rex/vec128.h>
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
 #include <locale.h>
+#endif
+
+// libc++ ships floating-point std::from_chars late; Android's NDK libc++
+// doesn't have it at all. The portable fallback covers those platforms.
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+#define REX_FLOAT_FROM_CHARS_PORTABLE 1
+#else
+#define REX_FLOAT_FROM_CHARS_PORTABLE 0
 #endif
 
 namespace rex::string {
@@ -114,7 +122,7 @@ inline T ifs(const std::string_view value, bool force_hex) {
   return result;
 }
 
-#if REX_PLATFORM_MAC
+#if REX_FLOAT_FROM_CHARS_PORTABLE
 template <typename T>
 inline std::from_chars_result portable_float_from_chars(const char* first, const char* last,
                                                         T& value) {
@@ -189,7 +197,7 @@ inline T fpfs(const std::string_view value, bool force_hex) {
     }
     std::memcpy(&result, &pun, sizeof(PUN));
   } else {
-#if REX_PLATFORM_MAC
+#if REX_FLOAT_FROM_CHARS_PORTABLE
     auto [p, error] = portable_float_from_chars(range.data(), range.data() + range.size(), result);
 #else
     auto [p, error] = std::from_chars(range.data(), range.data() + range.size(), result,
@@ -316,7 +324,7 @@ inline vec128_t from_string<vec128_t>(const std::string_view value, bool force_h
         assert_always();
         return vec128_t();
       }
-#if REX_PLATFORM_MAC
+#if REX_FLOAT_FROM_CHARS_PORTABLE
       auto result = detail::portable_float_from_chars(p, end, v.f32[i]);
 #else
       auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
