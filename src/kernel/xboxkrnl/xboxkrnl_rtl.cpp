@@ -394,7 +394,9 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   // Spin loop
   while (spin_count--) {
-    if (std::atomic_ref<int32_t>(cs->lock_count).load(std::memory_order_relaxed) != -1) {
+    // std::atomic_ref is unavailable on the Android NDK's libc++; the plain
+    // __atomic builtin covers every target with guest-memory semantics.
+    if (__atomic_load_n(&cs->lock_count, __ATOMIC_RELAXED) != -1) {
       rex::thread::SpinPause();
       continue;
     }
