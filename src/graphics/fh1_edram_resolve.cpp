@@ -128,6 +128,13 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
         pack = 3;
         bpb_log2 = 3;
         break;
+      // Forza Horizon 1 resolves the intro video's float16 rendering into a
+      // k_16_16_16_16 texture for presentation; skipping it left the video
+      // squeezed into horizontal strips with a black middle (log3 build #23).
+      case xenos::TextureFormat::k_16_16_16_16:
+        pack = 5;
+        bpb_log2 = 3;
+        break;
       default:
         break;
     }

@@ -24,7 +24,8 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
                             // 2: 2x stored as 4x)
   uint fh1_sample_select;   // sanitized xenos::CopySampleSelect
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
-  // 4: raw 32-bit word), endian 3:5, swap red/blue 6, float24 rounding 7,
+  // 4: raw 32-bit word, 5: 16_16_16_16), endian 3:5, swap red/blue 6, float24
+  // rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
   // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
   // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
@@ -152,6 +153,13 @@ void main(uint3 thread : SV_DispatchThreadID) {
     fh1_memory.Store(address, EndianSwap32(EncodeColor(color, FORMAT_2_10_10_10), endian));
   } else if (pack == 2u) {
     fh1_memory.Store(address, EndianSwap32(asuint(color.r), endian));
+  } else if (pack == 5u) {
+    // 16_16_16_16: four 16-bit UNORM words (64bpp), the intro video's
+    // presentation resolve format.
+    uint2 words = uint2(PackUnorm(color.r, 65535.0f) | (PackUnorm(color.g, 65535.0f) << 16u),
+                        PackUnorm(color.b, 65535.0f) | (PackUnorm(color.a, 65535.0f) << 16u));
+    fh1_memory.Store2(address,
+                       uint2(EndianSwap32(words.x, endian), EndianSwap32(words.y, endian)));
   } else {
     uint2 words = uint2(f32tof16(color.r) | (f32tof16(color.g) << 16u),
                         f32tof16(color.b) | (f32tof16(color.a) << 16u));

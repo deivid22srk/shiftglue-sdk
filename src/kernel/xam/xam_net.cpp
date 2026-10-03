@@ -584,7 +584,14 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
                          XSocket::Protocol((uint32_t)protocol));
 
+  // The title initializes its network stack right before transitioning from
+  // the intro video to the main menu (the crash log shows the guest reading
+  // through a null pointer ~1 ms after the first NetDll_socket call), so the
+  // arguments and the result of every socket creation are logged to tell a
+  // failed host socket creation from a guest-side null dereference.
   if (XFAILED(result)) {
+    REXKRNL_WARN("M2_TRACE net.socket af={} type={} proto={} -> failed 0x{:08X}", af, type,
+                 protocol, result);
     socket->Release();
 
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
@@ -592,6 +599,8 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
     return -1;
   }
 
+  REXKRNL_INFO("M2_TRACE net.socket af={} type={} proto={} -> handle 0x{:X}", af, type, protocol,
+               socket->handle());
   return socket->handle();
 }
 

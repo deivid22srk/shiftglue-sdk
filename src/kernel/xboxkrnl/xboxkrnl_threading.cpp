@@ -1394,6 +1394,16 @@ u32 InterlockedPopEntrySList_entry(ppc_ptr_t<X_SLIST_HEADER> plist_ptr) {
     old_hdr = *plist_ptr;
     auto next = REX_KERNEL_MEMORY()->TranslateVirtual<X_SINGLE_LIST_ENTRY*>(old_hdr.next.next);
     if (!old_hdr.next.next) {
+      // An empty pop returns zero the same way the console does; log the
+      // first few per thread, since a caller not checking for null crashes
+      // reading just past the null pointer.
+      static thread_local uint32_t empty_pops = 0;
+      if (empty_pops++ < 4) {
+        const auto* thread_state = runtime::ThreadState::Get();
+        REXKRNL_WARN("M2_TRACE slist.pop.empty plist={:08X} caller lr={:08X}",
+                     uint32_t(plist_ptr.guest_address()),
+                     thread_state ? uint32_t(thread_state->context()->lr) : 0u);
+      }
       return 0;
     }
     popped = old_hdr.next.next;
