@@ -28,6 +28,13 @@ namespace rex::platform {
 
 static thread_local SehThreadState tls_seh_state;
 static thread_local bool tls_seh_active = false;
+// Set while the decline path is calling a previously-installed handler.
+// Bionic's libsigchain may answer sigaction's oldact with the chain
+// trampoline rather than the previous handler; calling that re-runs the
+// whole chain from its head, which would re-enter this decline and eat the
+// stack one frame per round. Bound it to one level: a re-entered decline
+// falls through to the logged last resort below instead of chaining again.
+static thread_local bool tls_chaining_decline = false;
 
 // The handlers installed before ours, captured at install time: faults that
 // happen outside SEH-protected code belong to them (the MMIO handler and the
@@ -94,14 +101,20 @@ static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
     // degrades to the default action; when that is us, log the fault first —
     // silently dying here used to hide every crash outside a guest __try.
     const struct sigaction& previous = previous_actions[action_slot(sig)];
-    if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction) {
-      previous.sa_sigaction(sig, info, ucontext);
-      return;
-    }
-    if (!(previous.sa_flags & SA_SIGINFO) && previous.sa_handler != SIG_DFL &&
-        previous.sa_handler != SIG_IGN && previous.sa_handler) {
-      previous.sa_handler(sig);
-      return;
+    if (!tls_chaining_decline) {
+      if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction) {
+        tls_chaining_decline = true;
+        previous.sa_sigaction(sig, info, ucontext);
+        tls_chaining_decline = false;
+        return;
+      }
+      if (!(previous.sa_flags & SA_SIGINFO) && previous.sa_handler != SIG_DFL &&
+          previous.sa_handler != SIG_IGN && previous.sa_handler) {
+        tls_chaining_decline = true;
+        previous.sa_handler(sig);
+        tls_chaining_decline = false;
+        return;
+      }
     }
     // Nothing below us will report it: log the fault address and PC, then
     // let the default action end the process on the re-raised signal.

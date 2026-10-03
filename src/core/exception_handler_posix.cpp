@@ -41,6 +41,13 @@ namespace rex::arch {
 bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
 struct sigaction original_sigsegv_handler_;
+// Set while the decline path is calling the handler installed before us.
+// Under bionic's libsigchain, sigaction's oldact may hold the chain
+// trampoline instead of the previous handler; calling it re-runs the chain
+// from the head, which would re-enter this decline and recurse. Bound it to
+// one level: a re-entered decline degrades to the default action (after the
+// unhandled-fault log above) instead of chaining again.
+static thread_local bool tls_chaining_decline = false;
 #if REX_PLATFORM_MAC
 struct sigaction original_sigbus_handler_;
 #endif
@@ -458,14 +465,20 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     original = &original_sigbus_handler_;
   }
 #endif
-  if ((original->sa_flags & SA_SIGINFO) && original->sa_sigaction) {
-    original->sa_sigaction(signal_number, signal_info, signal_context);
-    return;
-  }
-  if (!(original->sa_flags & SA_SIGINFO) && original->sa_handler != SIG_DFL &&
-      original->sa_handler != SIG_IGN && original->sa_handler) {
-    original->sa_handler(signal_number);
-    return;
+  if (!tls_chaining_decline) {
+    if ((original->sa_flags & SA_SIGINFO) && original->sa_sigaction) {
+      tls_chaining_decline = true;
+      original->sa_sigaction(signal_number, signal_info, signal_context);
+      tls_chaining_decline = false;
+      return;
+    }
+    if (!(original->sa_flags & SA_SIGINFO) && original->sa_handler != SIG_DFL &&
+        original->sa_handler != SIG_IGN && original->sa_handler) {
+      tls_chaining_decline = true;
+      original->sa_handler(signal_number);
+      tls_chaining_decline = false;
+      return;
+    }
   }
   signal(signal_number, SIG_DFL);
 }
