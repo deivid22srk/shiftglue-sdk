@@ -68,6 +68,16 @@ REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, 
                     "tens of milliseconds to compile, and building a placeholder and then waiting "
                     "for the real one at every submission froze new scenes for seconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, 200, "GPU/Vulkan",
+                     "With vulkan_async_pipeline_no_placeholder, how long a draw whose pipeline is "
+                     "still being built waits on the GPU commands thread for the worker before the "
+                     "draw is skipped instead (0 waits not at all). Waiting keeps render target "
+                     "contents consistent - a skipped draw leaves the targets holding whatever a "
+                     "previous use of the same EDRAM tiles contained, which a later frame can "
+                     "present as stale or flickering image parts (intro videos, roads) while "
+                     "pipelines are warming up")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1285,14 +1295,52 @@ bool VulkanPipelineCache::ConfigurePipeline(
     if (found_pipeline == VK_NULL_HANDLE && use_async &&
         REXCVAR_GET(vulkan_async_pipeline_no_placeholder) &&
         it->second.is_placeholder.load(std::memory_order_acquire)) {
-      // A worker is still building it: the caller skips the draw.
-      last_pipeline_ = nullptr;
-      pipeline_out = VK_NULL_HANDLE;
-      pipeline_layout_out = nullptr;
-      if (pipeline_handle_out) {
-        *pipeline_handle_out = &it->second;
+      // A worker is still building it. Wait for it for a bounded time first:
+      // a skipped draw leaves the render targets holding whatever a previous
+      // use of the same EDRAM tiles contained, and a later frame can present
+      // that stale content (visible as flickering video/thumbnail layouts or
+      // garbage bands while pipelines are warming up). Workers keep compiling
+      // other queued pipelines while this thread waits, and the GPU commands
+      // thread is not needed for pipeline creation, so this cannot deadlock.
+      uint32_t wait_ms = uint32_t(REXCVAR_GET(vulkan_async_pipeline_wait_ms));
+      if (wait_ms) {
+        const auto wait_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+        while (true) {
+          // The worker publishes the pipeline first and the layout right after
+          // it, so wait for both before drawing with the pipeline.
+          if (it->second.pipeline.load(std::memory_order_acquire) != VK_NULL_HANDLE &&
+              it->second.pipeline_layout.load(std::memory_order_acquire) != nullptr) {
+            break;
+          }
+          if (!it->second.is_placeholder.load(std::memory_order_acquire)) {
+            // Creation failed (or the entry was reset) - no pipeline is coming.
+            break;
+          }
+          if (std::chrono::steady_clock::now() >= wait_deadline) {
+            static std::atomic<uint32_t> wait_timeouts_logged{0};
+            if (wait_timeouts_logged.fetch_add(1) < 8) {
+              REXGPU_WARN(
+                  "Vulkan pipeline still not built after {} ms, skipping the draw "
+                  "and the frame's present (repeat {})",
+                  wait_ms, wait_timeouts_logged.load());
+            }
+            break;
+          }
+          rex::thread::Sleep(std::chrono::milliseconds(1));
+        }
+        found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
       }
-      return pipeline_handle_out != nullptr;
+      if (found_pipeline == VK_NULL_HANDLE) {
+        // Still not built: the caller skips the draw.
+        last_pipeline_ = nullptr;
+        pipeline_out = VK_NULL_HANDLE;
+        pipeline_layout_out = nullptr;
+        if (pipeline_handle_out) {
+          *pipeline_handle_out = &it->second;
+        }
+        return pipeline_handle_out != nullptr;
+      }
     }
     if (found_pipeline == VK_NULL_HANDLE) {
       PipelineCreationArguments creation_arguments;

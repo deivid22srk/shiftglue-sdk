@@ -18,6 +18,7 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -2795,6 +2796,19 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
+  }
+  if (frontbuffer_format == xenos::TextureFormat::k_16_16_16_16) {
+    // The FMV presentation swap (the intro/attract videos): log each distinct
+    // packet/texture size combination once, for on-device diagnosis.
+    static std::mutex swap_log_mutex;
+    static std::unordered_set<std::string> swap_logged;
+    std::lock_guard<std::mutex> lock(swap_log_mutex);
+    std::string swap_signature =
+        fmt::format("packet {}x{} src {}x{} fmt 16_16_16_16", frontbuffer_width,
+                    frontbuffer_height, frontbuffer_width_unscaled, frontbuffer_height_unscaled);
+    if (swap_logged.insert(swap_signature).second) {
+      REXGPU_INFO("FH1 FMV presentation swap: {}", swap_signature);
+    }
   }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region

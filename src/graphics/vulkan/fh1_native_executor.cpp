@@ -2271,6 +2271,27 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   } else if (plan.copy) {
     const uint32_t extent_start = resolve_info.copy_dest_extent_start;
     const uint32_t extent_length = resolve_info.copy_dest_extent_length;
+    if (!plan.copying_depth &&
+        xenos::TextureFormat(plan.info.copy_dest_info.copy_dest_format) ==
+            xenos::TextureFormat::k_16_16_16_16) {
+      // The FMV presentation resolve (the intro/attract videos): log each
+      // distinct setup once, for on-device diagnosis of the video path.
+      static std::mutex logged_mutex;
+      static std::unordered_set<std::string> logged;
+      std::lock_guard<std::mutex> lock(logged_mutex);
+      std::string signature = fmt::format(
+          "rect ({}, {})-({}, {}) {}x{} src {:08X} pitch_tiles {} msaa {} fmt {} -> dest {:08X} "
+          "pitch {} extent {:08X}+{:X} endian {} swap {} bias {} samples {}",
+          plan.x0, plan.y0, plan.x1, plan.y1, plan.x1 - plan.x0, plan.y1 - plan.y0,
+          plan.color_info.color_base, plan.pitch_tiles, plan.msaa,
+          uint32_t(plan.color_info.color_format), plan.dest_base, plan.dest_pitch, extent_start,
+          extent_length, uint32_t(plan.info.copy_dest_info.copy_dest_endian),
+          uint32_t(plan.info.copy_dest_info.copy_dest_swap),
+          int32_t(plan.info.copy_dest_info.copy_dest_exp_bias), plan.sample_select);
+      if (logged.insert(signature).second) {
+        REXGPU_INFO("FH1 FMV presentation resolve: {}", signature);
+      }
+    }
     // The shader addresses guest memory from dest_base; the descriptor starts
     // at an aligned offset at or before both it and the written extent.
     const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
