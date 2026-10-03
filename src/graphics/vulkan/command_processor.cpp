@@ -4142,9 +4142,12 @@ VulkanCommandProcessor::ScratchBufferAcquisition VulkanCommandProcessor::Acquire
   scratch_buffer_memory_ = new_scratch_buffer_memory;
   scratch_buffer_ = new_scratch_buffer;
   scratch_buffer_size_ = size;
-  // Not used yet, no need for a barrier.
-  scratch_buffer_last_stage_mask_ = initial_access_mask;
-  scratch_buffer_last_access_mask_ = initial_stage_mask;
+  // Not used yet, no need for a barrier. The masks still must describe the
+  // upcoming usage, the same as on the reuse path below, because the returned
+  // acquisition's destructor refreshes last_stage_mask_/last_access_mask_ from
+  // them on release.
+  scratch_buffer_last_stage_mask_ = initial_stage_mask;
+  scratch_buffer_last_access_mask_ = initial_access_mask;
   scratch_buffer_last_usage_submission_ = submission_current;
   scratch_buffer_used_ = true;
   return ScratchBufferAcquisition(*this, new_scratch_buffer, initial_stage_mask,

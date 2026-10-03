@@ -72,6 +72,14 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+
+ public:
+  // Staging allocations for synchronous CPU-to-texture loads (the video plane
+  // fast path in the texture cache). The pool flushes mapped ranges in its
+  // page flush, so HOST-written bytes become visible to transfer reads once
+  // the pool's writes are flushed and the HOST_WRITE -> TRANSFER_READ barrier
+  // is submitted.
+  ui::vulkan::VulkanUploadBufferPool& upload_buffer_pool() { return *upload_buffer_pool_; }
 };
 
 }  // namespace rex::graphics::vulkan

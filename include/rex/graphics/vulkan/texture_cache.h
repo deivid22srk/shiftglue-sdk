@@ -151,6 +151,8 @@ class VulkanTextureCache final : public TextureCache {
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+  bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips,
+                                 bool resolve_sourced) override;
   bool LoadTextureDataFromResidentMemoryUntimed(Texture& texture, bool load_base, bool load_mips);
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;

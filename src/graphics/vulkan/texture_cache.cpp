@@ -1321,6 +1321,100 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
   return EnsureScaledResolveBufferAllocated(start_scaled, length_scaled);
 }
 
+bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base,
+                                                   bool load_mips, bool resolve_sourced) {
+  // Port of the Direct3D 12 fast path for linear single-level 8-bit textures
+  // (FH1's video planes, rewritten by the CPU every frame): snapshot the
+  // current guest memory synchronously into a staging buffer and queue-copy
+  // it, instead of going through the shared-memory page upload, whose
+  // snapshot races the video decoder rewriting the planes - on Adreno 660
+  // (Turnip) this tore the FMV output into a repeated top band with stale or
+  // zeroed rows below, and interleaved rows of different frames.
+  if (!load_base || load_mips || resolve_sourced) {
+    return false;
+  }
+  const TextureKey key = texture.key();
+  if (key.mip_max_level || key.scaled_resolve || key.tiled || !key.base_page ||
+      key.signed_separate || key.dimension != xenos::DataDimension::k2DOrStacked ||
+      key.GetDepthOrArraySize() != 1 || key.format != xenos::TextureFormat::k_8 ||
+      key.endianness != xenos::Endian::kNone || texture.force_load_3d_tiling()) {
+    return false;
+  }
+  VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+  const texture_util::TextureGuestLayout::Level& guest = texture.guest_layout().base;
+  const uint32_t size_bytes = guest.level_data_extent_bytes;
+  if (!size_bytes || size_bytes > SharedMemory::kBufferSize - (key.base_page << 12)) {
+    return false;
+  }
+  // The host image for unsigned k_8 is R8_UNORM; anything else (future format
+  // rework) takes the normal load rather than corrupting output.
+  if (GetHostFormatPair(key).format_unsigned.format != VK_FORMAT_R8_UNORM) {
+    return false;
+  }
+  VulkanCommandProcessor& processor = command_processor_;
+  if (!processor.submission_open()) {
+    return false;
+  }
+  // Staging from the shared memory's upload pool (created with
+  // VK_BUFFER_USAGE_TRANSFER_SRC_BIT). 4-byte alignment covers the
+  // VkBufferImageCopy bufferOffset requirement (the texel block size of R8 is
+  // 1 byte). The pool flushes mapped ranges in its page flush, and the
+  // HOST_WRITE -> TRANSFER_READ barrier below orders the visibility.
+  VkBuffer staging_buffer = VK_NULL_HANDLE;
+  VkDeviceSize staging_offset = 0;
+  VkDeviceSize staging_size = 0;
+  uint8_t* staging_mapping = static_cast<VulkanSharedMemory&>(shared_memory())
+                                 .upload_buffer_pool()
+                                 .RequestPartial(processor.GetCurrentSubmission(), size_bytes, 4,
+                                                 staging_buffer, staging_offset, staging_size);
+  if (!staging_mapping) {
+    return false;
+  }
+  // CopyCpuRange refuses GPU-written pages; the load lifecycle armed the watch
+  // before this call, so CPU writes racing the copy remain dirty and are
+  // re-uploaded through the shared-memory path for the next draw (the same
+  // contract as on Direct3D 12).
+  if (!shared_memory().CopyCpuRange(key.base_page << 12, {staging_mapping, size_bytes})) {
+    return false;
+  }
+  vulkan_texture.MarkAsUsed();
+  const VulkanTexture::Usage texture_old_usage =
+      vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+  if (texture_old_usage != VulkanTexture::Usage::kTransferDestination) {
+    VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
+    VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
+    VkImageLayout texture_old_layout, texture_new_layout;
+    GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
+                         texture_old_layout);
+    GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
+                         texture_dst_access_mask, texture_new_layout);
+    processor.PushImageMemoryBarrier(
+        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        texture_src_stage_mask ? texture_src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        texture_dst_stage_mask, texture_src_access_mask, texture_dst_access_mask,
+        texture_old_layout, texture_new_layout);
+  }
+  processor.PushBufferMemoryBarrier(staging_buffer, staging_offset, staging_size,
+                                    VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  processor.SubmitBarriers(true);
+  VkBufferImageCopy copy_region = {};
+  copy_region.bufferOffset = staging_offset;
+  // R8_UNORM is 1 byte per texel, so the buffer row length is the guest row
+  // pitch in bytes directly; 0 for the image height copies tightly packed
+  // rows at the given row length, reading exactly the guest extent.
+  copy_region.bufferRowLength = guest.row_pitch_bytes;
+  copy_region.bufferImageHeight = 0;
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageExtent.width = key.GetWidth();
+  copy_region.imageExtent.height = key.GetHeight();
+  copy_region.imageExtent.depth = 1;
+  processor.deferred_command_buffer().CmdVkCopyBufferToImage(
+      staging_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+      &copy_region);
+  return true;
+}
+
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
   // GPU time of the load for fh1_native_gpu_profile, split by resolve-sourced
@@ -1946,11 +2040,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   }
   command_processor_.SubmitBarriers(true);
-  VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
-      scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      level_last - level_first + 1);
+  // One copy command per level. Semantically identical to a single command
+  // with level_last - level_first + 1 regions, but avoids driver-side
+  // handling of multiple per-region bufferRowLength/bufferImageHeight values
+  // in one call — device logs (Turnip, Adreno 660) showed distant-LOD mosaic
+  // corruption for packed mip tails loaded as a multi-region copy, while the
+  // D3D12 backend (one CopyTextureRegion per level) is clean.
   for (uint32_t level = level_first; level <= level_last; ++level) {
-    VkBufferImageCopy& copy_region = copy_regions[level - level_first];
+    VkBufferImageCopy copy_region = {};
     const HostLayout& level_host_layout =
         level != 0 ? host_layout_mips[std::min(level, level_packed)] : host_layout_base;
     copy_region.bufferOffset = level_host_layout.offset_bytes;
@@ -1998,6 +2095,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
           std::min(copy_region.imageExtent.height,
                    std::max(height >> level, UINT32_C(1)) * texture_resolution_scale_y);
     }
+    command_buffer.CmdVkCopyBufferToImage(scratch_buffer, vulkan_texture.image(),
+                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                          &copy_region);
   }
 
   return true;
