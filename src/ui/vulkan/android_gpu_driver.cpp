@@ -18,7 +18,11 @@
 #include <system_error>
 
 #include <SDL3/SDL_system.h>
+// Adreno hardware only exists on ARM64, and libadrenotools' CMake refuses to
+// configure on any other architecture (x86_64 emulator builds included).
+#if defined(__aarch64__)
 #include <adrenotools/driver.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -37,6 +41,8 @@ REXCVAR_DEFINE_BOOL(android_gpu_turbo, false, "UI/Vulkan",
                     "Run the Adreno GPU at its highest clocks while the game is shown (thermal "
                     "limits still apply); restored in the background and at exit")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+#if defined(__aarch64__)
 
 namespace rex::ui::vulkan {
 
@@ -143,3 +149,30 @@ void SetAndroidGpuTurbo(bool shown) {
 }
 
 }  // namespace rex::ui::vulkan
+
+#else  // !defined(__aarch64__): stubs, so x86_64 emulator builds configure and
+       // link without libadrenotools.
+
+namespace rex::ui::vulkan {
+
+void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
+  const std::string name = REXCVAR_GET(android_gpu_driver);
+  if (!name.empty()) {
+    REXLOG_ERROR("Custom GPU driver {}: adrenotools is arm64-only; using the "
+                 "system driver",
+                 name);
+  }
+  return nullptr;
+}
+
+void SetAndroidGpuTurbo(bool shown) {
+  static bool warned = false;
+  if (shown && !warned && REXCVAR_GET(android_gpu_turbo)) {
+    REXLOG_ERROR("GPU turbo: adrenotools is arm64-only; clocks stay stock");
+    warned = true;
+  }
+}
+
+}  // namespace rex::ui::vulkan
+
+#endif  // defined(__aarch64__)

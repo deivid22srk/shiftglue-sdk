@@ -311,7 +311,12 @@ if(ANDROID)
     if(NOT CMAKE_ANDROID_ARCH_ABI)
         set(CMAKE_ANDROID_ARCH_ABI ${ANDROID_ABI})
     endif()
-    add_subdirectory(libadrenotools EXCLUDE_FROM_ALL)
+    # The hooks only make sense on Adreno hardware, which is ARM. libadrenotools'
+    # CMake hard-errors on any other architecture (the x86_64 emulator flavor
+    # included), so keep it out of those builds.
+    if(CMAKE_ANDROID_ARCH_ABI MATCHES "arm64-v8a|armeabi" OR ANDROID_ABI MATCHES "arm64-v8a|armeabi")
+        add_subdirectory(libadrenotools EXCLUDE_FROM_ALL)
+    endif()
 endif()
 
 #=============================================================================

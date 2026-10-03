@@ -158,9 +158,14 @@ endif()
 # Platform-specific dependencies
 if(ANDROID)
     target_link_libraries(rexui PUBLIC android)
-    target_link_libraries(rexui PRIVATE adrenotools)
-    # Loaded from the native library folder at run time, not linked.
-    add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+    # adrenotools and its hook libraries exist on ARM only (see
+    # thirdparty/CMakeLists.txt); other ABIs use the stubs in
+    # android_gpu_driver.cpp.
+    if(CMAKE_ANDROID_ARCH_ABI MATCHES "arm64-v8a|armeabi" OR ANDROID_ABI MATCHES "arm64-v8a|armeabi")
+        target_link_libraries(rexui PRIVATE adrenotools)
+        # Loaded from the native library folder at run time, not linked.
+        add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+    endif()
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
