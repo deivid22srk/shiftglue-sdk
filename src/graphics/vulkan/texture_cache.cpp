@@ -1360,13 +1360,21 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   // VkBufferImageCopy bufferOffset requirement (the texel block size of R8 is
   // 1 byte). The pool flushes mapped ranges in its page flush, and the
   // HOST_WRITE -> TRANSFER_READ barrier below orders the visibility.
+  //
+  // Request (not RequestPartial) must be used here: Request guarantees the
+  // full size contiguously in one page (opening a new page if needed), while
+  // RequestPartial grants only as many bytes as fit in the current page for
+  // incremental flushing. Copying the full size_bytes into a partial grant
+  // overflows the staging mapping (crashed with SIGSEGV writing outside guest
+  // memory on Adreno 660 / Turnip, GPU Recorder thread, during FMV playback).
+  // Request fails only if the size exceeds the whole page or the page can't be
+  // created - in that case fall back to the normal shared-memory load.
   VkBuffer staging_buffer = VK_NULL_HANDLE;
   VkDeviceSize staging_offset = 0;
-  VkDeviceSize staging_size = 0;
   uint8_t* staging_mapping = static_cast<VulkanSharedMemory&>(shared_memory())
                                  .upload_buffer_pool()
-                                 .RequestPartial(processor.GetCurrentSubmission(), size_bytes, 4,
-                                                 staging_buffer, staging_offset, staging_size);
+                                 .Request(processor.GetCurrentSubmission(), size_bytes, 4,
+                                          staging_buffer, staging_offset);
   if (!staging_mapping) {
     return false;
   }
@@ -1394,7 +1402,7 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
         texture_dst_stage_mask, texture_src_access_mask, texture_dst_access_mask,
         texture_old_layout, texture_new_layout);
   }
-  processor.PushBufferMemoryBarrier(staging_buffer, staging_offset, staging_size,
+  processor.PushBufferMemoryBarrier(staging_buffer, staging_offset, VkDeviceSize(size_bytes),
                                     VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
   processor.SubmitBarriers(true);
