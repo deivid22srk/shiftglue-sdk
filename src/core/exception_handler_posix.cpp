@@ -429,7 +429,7 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   // Log what was left unhandled first: without this the process dies on the
   // refault with only an unsymbolized stack and no fault address anywhere.
   {
-    const auto pc = reinterpret_cast<uintptr_t>(ex->pc());
+    const auto pc = reinterpret_cast<uintptr_t>(ex.pc());
     Dl_info info = {};
     char where[160];
     if (dladdr(reinterpret_cast<const void*>(pc), &info) && info.dli_fname) {
@@ -438,11 +438,11 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     } else {
       std::snprintf(where, sizeof(where), "0x%X", static_cast<unsigned>(pc));
     }
-    switch (ex->code()) {
+    switch (ex.code()) {
       case arch::Exception::Code::kAccessViolation:
         REXLOG_ERROR("Exception handler: unhandled {} access violation, fault address 0x{:X}, "
                      "PC {}",
-                     signal_number == SIGILL ? "SIGILL" : "SIGSEGV", ex->fault_address(), where);
+                     signal_number == SIGILL ? "SIGILL" : "SIGSEGV", ex.fault_address(), where);
         break;
       default:
         REXLOG_ERROR("Exception handler: unhandled signal {} at PC {}", signal_number, where);
