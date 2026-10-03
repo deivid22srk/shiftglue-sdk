@@ -2279,15 +2279,19 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       static std::mutex logged_mutex;
       static std::unordered_set<std::string> logged;
       std::lock_guard<std::mutex> lock(logged_mutex);
+      // Bit-fields cannot bind to the formatter's references; copy them out.
+      const uint32_t source_base = plan.color_info.color_base;
+      const uint32_t source_format = uint32_t(plan.color_info.color_format);
+      const uint32_t dest_endian = uint32_t(plan.info.copy_dest_info.copy_dest_endian);
+      const uint32_t dest_swap = uint32_t(plan.info.copy_dest_info.copy_dest_swap);
+      const int32_t dest_exp_bias = int32_t(plan.info.copy_dest_info.copy_dest_exp_bias);
       std::string signature = fmt::format(
           "rect ({}, {})-({}, {}) {}x{} src {:08X} pitch_tiles {} msaa {} fmt {} -> dest {:08X} "
           "pitch {} extent {:08X}+{:X} endian {} swap {} bias {} samples {}",
           plan.x0, plan.y0, plan.x1, plan.y1, plan.x1 - plan.x0, plan.y1 - plan.y0,
-          plan.color_info.color_base, plan.pitch_tiles, plan.msaa,
-          uint32_t(plan.color_info.color_format), plan.dest_base, plan.dest_pitch, extent_start,
-          extent_length, uint32_t(plan.info.copy_dest_info.copy_dest_endian),
-          uint32_t(plan.info.copy_dest_info.copy_dest_swap),
-          int32_t(plan.info.copy_dest_info.copy_dest_exp_bias), plan.sample_select);
+          source_base, plan.pitch_tiles, plan.msaa, source_format, plan.dest_base,
+          plan.dest_pitch, extent_start, extent_length, dest_endian, dest_swap, dest_exp_bias,
+          plan.sample_select);
       if (logged.insert(signature).second) {
         REXGPU_INFO("FH1 FMV presentation resolve: {}", signature);
       }
