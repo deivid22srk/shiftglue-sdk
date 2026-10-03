@@ -316,6 +316,17 @@ if(ANDROID)
     # included), so keep it out of those builds.
     if(CMAKE_ANDROID_ARCH_ABI MATCHES "arm64-v8a|armeabi" OR ANDROID_ABI MATCHES "arm64-v8a|armeabi")
         add_subdirectory(libadrenotools EXCLUDE_FROM_ALL)
+        # The rex config postfix seeds every library defined after it
+        # (CMAKE_RELWITHDEBINFO_POSTFIX "rd"), which would rename the hooks to
+        # libmain_hookrd.so and friends — but libadrenotools' loader dlopens
+        # them by the hardcoded upstream names ("libhook_impl.so",
+        # "libmain_hook.so"), and a rename silently breaks custom-driver
+        # loading into a system-driver fallback. Clear the postfix on them.
+        foreach(adrenotools_hook IN ITEMS main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+            set_target_properties(${adrenotools_hook} PROPERTIES
+                DEBUG_POSTFIX ""
+                RELWITHDEBINFO_POSTFIX "")
+        endforeach()
     endif()
 endif()
 

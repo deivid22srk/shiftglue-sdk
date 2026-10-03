@@ -129,8 +129,10 @@ void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
                                             hook_dir.c_str(), target_dir.c_str(),
                                             library.c_str(), nullptr, nullptr);
   if (!handle) {
+    // dlerror clears its state: read once.
+    const char* reason = dlerror();
     REXLOG_ERROR("Custom GPU driver {}: adrenotools could not load {} ({})", name, library,
-                 dlerror() ? dlerror() : "no reason given");
+                 reason ? reason : "no reason given (see the hook_impl logcat tag)");
     return nullptr;
   }
   REXLOG_INFO("Custom GPU driver {}: loaded {} through adrenotools", name, library);
