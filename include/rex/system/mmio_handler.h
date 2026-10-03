@@ -75,6 +75,11 @@ class MMIOHandler {
   static bool ExceptionCallbackThunk(arch::Exception* ex, void* data);
   bool ExceptionCallback(arch::Exception* ex);
 
+  // One-line record of a fault the handler is about to decline: address,
+  // arena bounds and a library+offset PC. Silent declines cost a whole
+  // diagnosis cycle every time a game finds a new way to fault.
+  void LogUnhandledFault(arch::Exception* ex, const char* reason);
+
   uint8_t* virtual_membase_;
   uint8_t* physical_membase_;
   uint8_t* memory_end_;

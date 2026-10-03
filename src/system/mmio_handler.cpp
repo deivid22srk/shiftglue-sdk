@@ -13,14 +13,15 @@
 #include <cstring>
 #include <utility>
 
+// dladdr is available on every platform this file builds for (Linux, Android,
+// macOS).
+#include <dlfcn.h>
+
 #include <rex/assert.h>
 #include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
-#if REX_PLATFORM_LINUX
-#include <dlfcn.h>
-#endif
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
@@ -371,6 +372,21 @@ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
 }
 
+void MMIOHandler::LogUnhandledFault(arch::Exception* ex, const char* reason) {
+  const auto pc = reinterpret_cast<uintptr_t>(ex->pc());
+  Dl_info info = {};
+  if (dladdr(reinterpret_cast<const void*>(pc), &info) && info.dli_fname) {
+    REXSYS_ERROR(
+        "Unhandled fault ({}): address 0x{:X}, guest memory 0x{:X}..0x{:X}, PC {} +0x{:X}",
+        reason, ex->fault_address(), uint64_t(virtual_membase_), uint64_t(memory_end_),
+        info.dli_fname, pc - reinterpret_cast<uintptr_t>(info.dli_fbase));
+  } else {
+    REXSYS_ERROR("Unhandled fault ({}): address 0x{:X}, guest memory 0x{:X}..0x{:X}, PC 0x{:X}",
+                 reason, ex->fault_address(), uint64_t(virtual_membase_), uint64_t(memory_end_),
+                 pc);
+  }
+}
+
 bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
   if (ex->code() != arch::Exception::Code::kAccessViolation) {
     return false;
@@ -379,12 +395,22 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
   if (operation != arch::Exception::AccessViolationOperation::kRead &&
       operation != arch::Exception::AccessViolationOperation::kWrite) {
     // Data Execution Prevention or something else uninteresting.
+    // Log it once per thread: an instruction-fetch fault here used to vanish
+    // silently and the process died on the refault with no address anywhere.
+    static thread_local bool logged_unknown_operation = false;
+    if (!logged_unknown_operation) {
+      logged_unknown_operation = true;
+      LogUnhandledFault(ex, "non-r/w access violation");
+    }
     return false;
   }
   bool is_write = operation == arch::Exception::AccessViolationOperation::kWrite;
   if (ex->fault_address() < uint64_t(virtual_membase_) ||
       ex->fault_address() > uint64_t(memory_end_)) {
-    // Quick kill anything outside our mapping.
+    // Quick kill anything outside our mapping. Log it: this is the path a
+    // wild host pointer (or a sign-extended guest address) reaches, and it
+    // used to be completely silent.
+    LogUnhandledFault(ex, is_write ? "write outside guest memory" : "read outside guest memory");
     return false;
   }
   void* fault_host_address = reinterpret_cast<void*>(ex->fault_address());

@@ -233,8 +233,12 @@ u32 CreateFiber_entry(u32 dwStackSize, u32 lpStartAddress, mapped_void lpParamet
   fiber->sp_save = initial_sp;
 
   // Create host fiber
+  // The recompiled functions run their frames on this stack, and they are
+  // considerably fatter than their PPC counterparts (spills, no shrunken
+  // leaf frames). 256 KiB left no headroom for the deeper driver paths
+  // (Forza Horizon's swap chain reached an unmapped page past the end).
   size_t host_stack =
-      std::max(static_cast<size_t>(guest_stack_size), static_cast<size_t>(256u * 1024u));
+      std::max(static_cast<size_t>(guest_stack_size), static_cast<size_t>(1024u * 1024u));
   auto args_owner = std::make_unique<FiberEntryArgs>(FiberEntryArgs{
       start_fn,
       buf_addr,

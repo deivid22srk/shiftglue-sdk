@@ -199,8 +199,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 
   // Guest vblank timer based on the configured guest video mode.
   vsync_worker_running_ = true;
+  // 1 MiB, not the bare minimum: the GPU interrupt callback is title code and
+  // runs on this thread's stack, so recompiled frames of the title's own
+  // interrupt handler live here.
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+      new system::XHostThread(kernel_state_, 1024 * 1024, 0, [this]() {
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
