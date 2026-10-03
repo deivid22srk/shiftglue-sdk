@@ -88,6 +88,8 @@ std::string DriverLibraryName(const std::filesystem::path& folder) {
 void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
   const std::string name = REXCVAR_GET(android_gpu_driver);
   if (name.empty()) {
+    REXLOG_INFO("Custom GPU driver: none selected, using the system driver "
+                "(pick one on the game picker screen to change this)");
     return nullptr;
   }
   const std::filesystem::path source = drivers_root / name;
