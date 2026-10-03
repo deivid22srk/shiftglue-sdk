@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <utility>
@@ -47,6 +48,10 @@ REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
                     "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
                     "device without them, to measure that path where BC is supported")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_fmv_debug, false, "GPU/Vulkan",
+                    "Log per-load diagnostics of the FH1 video plane CPU fast path (snapshot "
+                    "completeness, refusals) for on-device video debugging")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -1383,7 +1388,44 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   // re-uploaded through the shared-memory path for the next draw (the same
   // contract as on Direct3D 12).
   if (!shared_memory().CopyCpuRange(key.base_page << 12, {staging_mapping, size_bytes})) {
+    if (REXCVAR_GET(fh1_fmv_debug)) {
+      static std::atomic<uint32_t> fmv_debug_refusals{0};
+      const uint32_t fmv_debug_refusal =
+          fmv_debug_refusals.fetch_add(1, std::memory_order_relaxed);
+      if (fmv_debug_refusal % 16 == 0) {
+        REXGPU_INFO("fh1 fmv plane load refused (GPU-written pages): {:08X} bytes {}",
+                    key.base_page << 12, size_bytes);
+      }
+    }
     return false;
+  }
+  if (REXCVAR_GET(fh1_fmv_debug)) {
+    // Snapshot completeness probe: the decoder rewrites the plane top to
+    // bottom, so all-zero chunks mean the load caught the plane before the
+    // frame finished arriving - the game presents those as black video frames
+    // with a partial top strip. Rate-limited to every 30th load.
+    static std::atomic<uint32_t> fmv_debug_loads{0};
+    const uint32_t fmv_debug_index = fmv_debug_loads.fetch_add(1, std::memory_order_relaxed);
+    if (fmv_debug_index % 30 == 0 && size_bytes >= 64) {
+      constexpr size_t kFmvDebugChunk = 64;
+      unsigned fmv_debug_zero_chunks = 0;
+      for (unsigned fmv_debug_i = 0; fmv_debug_i < 5; ++fmv_debug_i) {
+        const size_t fmv_debug_offset = std::min(
+            (size_t(fmv_debug_i) * size_bytes) / 5, size_bytes - kFmvDebugChunk);
+        const uint8_t* fmv_debug_data = staging_mapping + fmv_debug_offset;
+        bool fmv_debug_all_zero = true;
+        for (size_t fmv_debug_j = 0; fmv_debug_j < kFmvDebugChunk; ++fmv_debug_j) {
+          if (fmv_debug_data[fmv_debug_j]) {
+            fmv_debug_all_zero = false;
+            break;
+          }
+        }
+        fmv_debug_zero_chunks += fmv_debug_all_zero ? 1 : 0;
+      }
+      REXGPU_INFO("fh1 fmv plane load #{}: {:08X} {}x{} pitch {} bytes {} zero chunks {}/5",
+                  fmv_debug_index, key.base_page << 12, key.GetWidth(), key.GetHeight(),
+                  guest.row_pitch_bytes, size_bytes, fmv_debug_zero_chunks);
+    }
   }
   vulkan_texture.MarkAsUsed();
   const VulkanTexture::Usage texture_old_usage =
