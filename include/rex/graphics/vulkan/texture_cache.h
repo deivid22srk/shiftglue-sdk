@@ -230,10 +230,11 @@ class VulkanTextureCache final : public TextureCache {
     VkImageView GetCopyView();
 
     // Fast-path CPU video plane loads: whether the last uploaded snapshot
-    // was a complete frame. Incomplete snapshots (the guest decoder still
-    // rewriting the plane top to bottom) are skipped while a complete frame
-    // is already present, so a starved decoder presents the last complete
-    // frame instead of black video.
+    // was a complete frame. Partially decoded snapshots (the guest decoder
+    // still rewriting the plane top to bottom; all-zero planes are never
+    // retained) are skipped while a complete frame is already present, so a
+    // starved decoder presents the last complete frame instead of black
+    // video. Gated by the fh1_fmv_retain cvar.
     bool holds_complete_video_frame() const { return holds_complete_video_frame_; }
     void set_holds_complete_video_frame(bool holds) { holds_complete_video_frame_ = holds; }
 
