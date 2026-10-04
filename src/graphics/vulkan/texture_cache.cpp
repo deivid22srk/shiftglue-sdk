@@ -48,14 +48,19 @@ REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
                     "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
                     "device without them, to measure that path where BC is supported")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_fmv_debug, false, "GPU/Vulkan",
+// On by default while the on-device FMV playback is being validated: the
+// lines are rate-limited (every 30th load / 32nd retained snapshot), and
+// without them the owner's device logs show no classification evidence to
+// tell a frozen decoder from a retained torn one. Turn off once the FMV
+// playback is confirmed stable.
+REXCVAR_DEFINE_BOOL(fh1_fmv_debug, true, "GPU/Vulkan",
                     "Log per-load diagnostics of the FH1 video plane CPU fast path (snapshot "
-                    "completeness, refusals) for on-device video debugging")
+                    "classification, refusals) for on-device video debugging")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_fmv_retain, true, "GPU/Vulkan",
                     "Keep the last complete frame on the texture when the FH1 video plane "
-                    "CPU fast path snapshots a partially decoded plane (black-frame fix); "
-                    "false restores always uploading every snapshot")
+                    "CPU fast path snapshots a torn mid-rewrite plane (the decoder rewrites "
+                    "it top to bottom); false restores always uploading every snapshot")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
