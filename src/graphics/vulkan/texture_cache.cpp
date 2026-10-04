@@ -52,6 +52,11 @@ REXCVAR_DEFINE_BOOL(fh1_fmv_debug, false, "GPU/Vulkan",
                     "Log per-load diagnostics of the FH1 video plane CPU fast path (snapshot "
                     "completeness, refusals) for on-device video debugging")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_fmv_retain, true, "GPU/Vulkan",
+                    "Keep the last complete frame on the texture when the FH1 video plane "
+                    "CPU fast path snapshots a partially decoded plane (black-frame fix); "
+                    "false restores always uploading every snapshot")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -1335,10 +1340,10 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   // snapshot races the video decoder rewriting the planes - on Adreno 660
   // (Turnip) this tore the FMV output into a repeated top band with stale or
   // zeroed rows below, and interleaved rows of different frames.
-  // Vulkan additionally retains the last complete frame across incomplete
-  // snapshots (see the completeness probe below); the Direct3D 12 path
-  // keeps uploading best-effort because desktop hosts rarely starve the
-  // decoder.
+  // Vulkan additionally retains the last complete frame across partially
+  // decoded snapshots (see the completeness probe below; gated by
+  // fh1_fmv_retain); the Direct3D 12 path keeps uploading best-effort
+  // because desktop hosts rarely starve the decoder.
   if (!load_base || load_mips || resolve_sourced) {
     return false;
   }
@@ -1362,6 +1367,9 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   }
   VulkanCommandProcessor& processor = command_processor_;
   if (!processor.submission_open()) {
+    // The shared-memory fallback below overwrites the texture, so the last
+    // complete frame it holds is no longer guaranteed.
+    vulkan_texture.set_holds_complete_video_frame(false);
     return false;
   }
   // Staging from the shared memory's upload pool (created with
@@ -1385,6 +1393,7 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
                                  .Request(processor.GetCurrentSubmission(), size_bytes, 4,
                                           staging_buffer, staging_offset);
   if (!staging_mapping) {
+    vulkan_texture.set_holds_complete_video_frame(false);
     return false;
   }
   // CopyCpuRange refuses GPU-written pages; the load lifecycle armed the watch
@@ -1401,6 +1410,7 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
                     key.base_page << 12, size_bytes);
       }
     }
+    vulkan_texture.set_holds_complete_video_frame(false);
     return false;
   }
   // Snapshot completeness probe (always on): the decoder rewrites the plane
@@ -1408,17 +1418,25 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   // frame finished arriving - a starved decoder presents those partial
   // frames as black video with a partial top strip while the audio keeps
   // playing (build #37 evidence). When the texture already holds a complete
-  // frame, skip such incomplete snapshots and keep presenting the last
-  // complete frame: the memory watch stays armed, so the decoder's next
-  // write re-outdates the plane and the following draw retries the load.
-  // The retention only applies to plane-sized surfaces (small 8-bit masks
-  // that legitimately contain all-zero rows still upload), and a texture
-  // that has never held a complete frame is always refreshed best-effort,
-  // so a letterboxed video (bottom rows always zero) never freezes.
+  // frame, skip such PARTIAL snapshots and keep presenting the last complete
+  // frame: the memory watch stays armed, so the decoder's next write
+  // re-outdates the plane and the following draw retries the load. A starved
+  // decoder then shows the last complete frame instead of black video and
+  // recovers by itself.
+  // All-zero snapshots are NOT retained: a fully-zero plane is also what a
+  // legitimately complete black frame looks like (a fade to black, or a
+  // cleared mask), and retaining those would pin a stale frame forever -
+  // they upload best-effort exactly as before. The retention only applies to
+  // plane-sized surfaces (small 8-bit masks that legitimately contain
+  // all-zero rows still upload), and a texture that has never held a
+  // complete frame is always refreshed best-effort, so a letterboxed video
+  // (bottom rows always zero) never freezes. fh1_fmv_retain = false
+  // restores the always-upload behavior.
   constexpr size_t kFmvChunkBytes = 64;
   constexpr unsigned kFmvChunkCount = 5;
   unsigned fmv_zero_chunks = 0;
-  if (size_bytes >= kFmvChunkCount * kFmvChunkBytes) {
+  const bool fmv_probe = size_bytes >= kFmvChunkCount * kFmvChunkBytes;
+  if (fmv_probe) {
     for (unsigned fmv_chunk = 0; fmv_chunk < kFmvChunkCount; ++fmv_chunk) {
       const size_t fmv_offset =
           std::min((size_t(fmv_chunk) * size_bytes) / kFmvChunkCount,
@@ -1435,10 +1453,13 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
     }
   }
   const bool fmv_snapshot_complete = fmv_zero_chunks == 0;
+  const bool fmv_snapshot_partial =
+      fmv_probe && fmv_zero_chunks > 0 && fmv_zero_chunks < kFmvChunkCount;
   const bool fmv_plane_sized = key.GetWidth() >= 320 && key.GetHeight() >= 180;
   if (fmv_snapshot_complete) {
     vulkan_texture.set_holds_complete_video_frame(true);
-  } else if (vulkan_texture.holds_complete_video_frame() && fmv_plane_sized) {
+  } else if (fmv_snapshot_partial && vulkan_texture.holds_complete_video_frame() &&
+             fmv_plane_sized && REXCVAR_GET(fh1_fmv_retain)) {
     vulkan_texture.MarkAsUsed();
     static std::atomic<uint32_t> fmv_retained_frames{0};
     const uint32_t fmv_retained = fmv_retained_frames.fetch_add(1, std::memory_order_relaxed);
@@ -1455,7 +1476,7 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   if (REXCVAR_GET(fh1_fmv_debug)) {
     static std::atomic<uint32_t> fmv_debug_loads{0};
     const uint32_t fmv_debug_index = fmv_debug_loads.fetch_add(1, std::memory_order_relaxed);
-    if (fmv_debug_index % 30 == 0) {
+    if (fmv_debug_index % 30 == 0 && fmv_probe) {
       REXGPU_INFO("fh1 fmv plane load #{}: {:08X} {}x{} pitch {} bytes {} zero chunks {}/{}",
                   fmv_debug_index, key.base_page << 12, key.GetWidth(), key.GetHeight(),
                   guest.row_pitch_bytes, size_bytes, fmv_zero_chunks, kFmvChunkCount);
