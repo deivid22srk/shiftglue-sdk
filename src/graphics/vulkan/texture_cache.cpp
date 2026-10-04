@@ -1291,7 +1291,16 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   VkImage image;
   VmaAllocation allocation;
   if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
-                     &allocation, nullptr)) {
+                     &allocation, nullptr) != VK_SUCCESS) {
+    // Guest-visible failure (the null texture binds a zero image), previously
+    // silent - a game sampling it shows black or broken content. Log the key
+    // and the requested extent so device logs identify the resource.
+    REXGPU_ERROR(
+        "VulkanTextureCache: Failed to allocate a {}x{}x{} {} mip levels {} "
+        "texture image ({:08X})",
+        key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
+        uint32_t(GetHostFormatPair(key).format_unsigned.format), unsigned(key.mip_max_level) + 1,
+        key.base_page << 12);
     return nullptr;
   }
 
