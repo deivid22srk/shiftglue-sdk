@@ -1296,8 +1296,8 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     // silent - a game sampling it shows black or broken content. Log the key
     // and the requested extent so device logs identify the resource.
     REXGPU_ERROR(
-        "VulkanTextureCache: Failed to allocate a {}x{}x{} {} mip levels {} "
-        "texture image ({:08X})",
+        "VulkanTextureCache: Failed to allocate a {}x{}x{} format {} mip "
+        "levels {} texture image ({:08X})",
         key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
         uint32_t(GetHostFormatPair(key).format_unsigned.format), unsigned(key.mip_max_level) + 1,
         key.base_page << 12);
@@ -1605,17 +1605,31 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
       if (fmv_static_zero_top) {
         fmv_baseline_refresh = true;
       } else {
-        vulkan_texture.MarkAsUsed();
-        static std::atomic<uint32_t> fmv_retained_zero_tail_frames{0};
-        const uint32_t fmv_retained_zero_tail =
-            fmv_retained_zero_tail_frames.fetch_add(1, std::memory_order_relaxed);
-        if (fmv_retained_zero_tail % 32 == 0) {
-          REXGPU_INFO("fh1 fmv partial snapshot with zero tail retained last complete "
-                      "frame: {:08X} {}x{} band {}/{} bytes {}",
-                      key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_changed_high,
-                      fmv_changed_low, size_bytes);
+        // Same boundary-repeat escape as the non-zero-tail branch below: a
+        // band that sits at the same block for several consecutive
+        // snapshots is not a descending cursor - content whose top is
+        // static while lower rows churn. Upload so those frames keep
+        // flowing (an occasionally torn upload costs less than freezing
+        // the video; a real decode moves the band every snapshot).
+        const bool fmv_band_moved =
+            fmv_changed_high != vulkan_texture.video_frame_boundary_block();
+        vulkan_texture.note_video_frame_boundary(fmv_changed_high, fmv_band_moved);
+        if (!fmv_band_moved &&
+            vulkan_texture.video_frame_boundary_repeats() >= kFmvBoundaryRepeatUpload) {
+          fmv_baseline_refresh = true;
+        } else {
+          vulkan_texture.MarkAsUsed();
+          static std::atomic<uint32_t> fmv_retained_zero_tail_frames{0};
+          const uint32_t fmv_retained_zero_tail =
+              fmv_retained_zero_tail_frames.fetch_add(1, std::memory_order_relaxed);
+          if (fmv_retained_zero_tail % 32 == 0) {
+            REXGPU_INFO("fh1 fmv partial snapshot with zero tail retained last complete "
+                        "frame: {:08X} {}x{} band {}/{} bytes {}",
+                        key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_changed_high,
+                        fmv_changed_low, size_bytes);
+          }
+          return true;
         }
-        return true;
       }
     } else {
       const bool fmv_boundary_moved =
