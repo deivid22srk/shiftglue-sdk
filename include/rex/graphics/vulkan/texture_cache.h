@@ -229,14 +229,44 @@ class VulkanTextureCache final : public TextureCache {
     void set_copy_words(uint32_t words) { copy_words_ = words; }
     VkImageView GetCopyView();
 
-    // Fast-path CPU video plane loads: whether the last uploaded snapshot
-    // was a complete frame. Partially decoded snapshots (the guest decoder
-    // still rewriting the plane top to bottom; all-zero planes are never
-    // retained) are skipped while a complete frame is already present, so a
-    // starved decoder presents the last complete frame instead of black
-    // video. Gated by the fh1_fmv_retain cvar.
-    bool holds_complete_video_frame() const { return holds_complete_video_frame_; }
-    void set_holds_complete_video_frame(bool holds) { holds_complete_video_frame_ = holds; }
+    // Fast-path CPU video plane loads: the bytes of the last uploaded
+    // snapshot (the torn-frame detection baseline), the block boundary of
+    // the last retained torn snapshot (the decoder cursor estimate), and
+    // how many consecutive torn snapshots sat at that boundary. The guest
+    // software decoder rewrites the plane top to bottom, and a snapshot
+    // caught mid-rewrite holds new rows above the cursor and the previous
+    // frame's non-zero rows below - invisible to a zero-chunk probe. Each
+    // new snapshot is diffed against the baseline: a changed prefix with an
+    // unchanged non-zero tail whose boundary moved since the previous
+    // snapshot is a decode in progress, and the last complete frame is
+    // retained on the texture instead of uploading the torn one. Gated by
+    // the fh1_fmv_retain cvar; only plane-sized surfaces keep a baseline,
+    // so small 8-bit masks keep uploading as before.
+    bool has_video_frame_baseline(size_t size_bytes) const {
+      return video_frame_baseline_.size() == size_bytes;
+    }
+    const uint8_t* video_frame_baseline() const { return video_frame_baseline_.data(); }
+    void set_video_frame_baseline(const uint8_t* data, size_t size_bytes) {
+      video_frame_baseline_.assign(data, data + size_bytes);
+      video_frame_boundary_block_ = kNoVideoFrameBoundary;
+      video_frame_boundary_repeats_ = 0;
+    }
+    uint32_t video_frame_boundary_block() const { return video_frame_boundary_block_; }
+    uint32_t video_frame_boundary_repeats() const { return video_frame_boundary_repeats_; }
+    void note_video_frame_boundary(uint32_t block, bool moved) {
+      if (!moved) {
+        ++video_frame_boundary_repeats_;
+        return;
+      }
+      video_frame_boundary_block_ = block;
+      video_frame_boundary_repeats_ = 1;
+    }
+    void clear_video_frame_state() {
+      video_frame_baseline_.clear();
+      video_frame_boundary_block_ = kNoVideoFrameBoundary;
+      video_frame_boundary_repeats_ = 0;
+    }
+    static constexpr uint32_t kNoVideoFrameBoundary = UINT32_MAX;
 
    private:
     union ViewKey {
@@ -293,7 +323,10 @@ class VulkanTextureCache final : public TextureCache {
 
     Usage usage_ = Usage::kUndefined;
 
-    bool holds_complete_video_frame_ = false;
+    // Fast-path CPU video plane load state (see the accessors above).
+    std::vector<uint8_t> video_frame_baseline_;
+    uint32_t video_frame_boundary_block_ = UINT32_MAX;
+    uint32_t video_frame_boundary_repeats_ = 0;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     // The last view returned per signedness, by its GetView arguments: a

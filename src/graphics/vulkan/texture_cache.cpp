@@ -1341,10 +1341,16 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   // (Turnip) this tore the FMV output into a repeated top band with stale or
   // zeroed rows below, and interleaved rows of different frames.
   // Vulkan additionally retains the last complete frame across partially
-  // decoded snapshots (see the completeness probe below; gated by
+  // decoded snapshots (see the snapshot classification below; gated by
   // fh1_fmv_retain); the Direct3D 12 path keeps uploading best-effort
   // because desktop hosts rarely starve the decoder.
   if (!load_base || load_mips || resolve_sourced) {
+    if (load_base) {
+      // The fallback (or a resolve) is about to rewrite the base image the
+      // torn-frame baseline mirrors; drop it so the next fast-path load
+      // rebuilds the detection from a fresh upload.
+      static_cast<VulkanTexture&>(texture).clear_video_frame_state();
+    }
     return false;
   }
   const TextureKey key = texture.key();
@@ -1369,7 +1375,7 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   if (!processor.submission_open()) {
     // The shared-memory fallback below overwrites the texture, so the last
     // complete frame it holds is no longer guaranteed.
-    vulkan_texture.set_holds_complete_video_frame(false);
+    vulkan_texture.clear_video_frame_state();
     return false;
   }
   // Staging from the shared memory's upload pool (created with
@@ -1393,7 +1399,7 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
                                  .Request(processor.GetCurrentSubmission(), size_bytes, 4,
                                           staging_buffer, staging_offset);
   if (!staging_mapping) {
-    vulkan_texture.set_holds_complete_video_frame(false);
+    vulkan_texture.clear_video_frame_state();
     return false;
   }
   // CopyCpuRange refuses GPU-written pages; the load lifecycle armed the watch
@@ -1410,30 +1416,59 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
                     key.base_page << 12, size_bytes);
       }
     }
-    vulkan_texture.set_holds_complete_video_frame(false);
+    vulkan_texture.clear_video_frame_state();
     return false;
   }
-  // Snapshot completeness probe (always on): the decoder rewrites the plane
-  // top to bottom, so zero chunks mean the load caught the plane before the
-  // frame finished arriving - a starved decoder presents those partial
-  // frames as black video with a partial top strip while the audio keeps
-  // playing (build #37 evidence). When the texture already holds a complete
-  // frame, skip such PARTIAL snapshots and keep presenting the last complete
-  // frame: the memory watch stays armed, so the decoder's next write
-  // re-outdates the plane and the following draw retries the load. A starved
-  // decoder then shows the last complete frame instead of black video and
-  // recovers by itself.
-  // All-zero snapshots are NOT retained: a fully-zero plane is also what a
-  // legitimately complete black frame looks like (a fade to black, or a
-  // cleared mask), and retaining those would pin a stale frame forever -
-  // they upload best-effort exactly as before. The retention only applies to
-  // plane-sized surfaces (small 8-bit masks that legitimately contain
-  // all-zero rows still upload), and a texture that has never held a
-  // complete frame is always refreshed best-effort, so a letterboxed video
-  // (bottom rows always zero) never freezes. fh1_fmv_retain = false
-  // restores the always-upload behavior.
+  // Snapshot classification (always on). Two probes run on every snapshot.
+  //
+  // The zero-chunk probe catches a plane that was never fully decoded
+  // (fresh video start): the guest software decoder rewrites the plane top
+  // to bottom, and the not-yet-written tail is still zero (build #37
+  // evidence: black video with a partial top strip while the audio keeps
+  // playing). Snapshots with zero chunks upload best-effort exactly as
+  // before: a texture that never held a complete frame has nothing better
+  // to show, and a letterboxed video (bottom rows always zero) never
+  // freezes. All-zero snapshots are never retained either - a fully-zero
+  // plane is also what a legitimately complete black frame looks like (a
+  // fade to black), and retaining those would pin a stale frame forever.
+  //
+  // The baseline diff catches the steady state the zero probe is blind
+  // to: once the plane has held a frame, the tail below the decoder cursor
+  // holds the PREVIOUS frame's non-zero pixels, so a mid-rewrite snapshot
+  // has no zero chunks at all yet is still torn (new rows above the
+  // cursor, stale rows below). Uploading those was the flicker that
+  // survived the build 42 retention - the owner's build 42 device log
+  // shows zero retained events, so every snapshot looked complete to the
+  // zero probe. The bytes of the last uploaded frame are kept on the
+  // texture as the baseline, and each new snapshot is diffed against them
+  // block-wise:
+  //   - no block differs: the plane is byte-identical to what the texture
+  //     already shows (a re-published frame, paused video) - skip the
+  //     upload entirely.
+  //   - changes reach the last block: a fully rewritten plane - upload.
+  //   - the unchanged tail below the lowest changed block is all zero: a
+  //     complete frame whose bottom rows are legitimately black (a
+  //     letterbox bar, a fade) - upload; a torn snapshot caught inside a
+  //     bottom black bar is visually identical to the complete frame.
+  //   - the unchanged tail is non-zero stale content and the changed
+  //     prefix boundary MOVED since the previous snapshot: the decoder
+  //     cursor is descending mid-rewrite - retain the last complete frame
+  //     (skip the upload; the memory watch stays armed, so the decoder's
+  //     next write re-outdates the plane and the following draw retries
+  //     the load). A starved decoder then shows the last complete frame
+  //     instead of tearing.
+  //   - the boundary sat at the same block for several consecutive
+  //     snapshots: not a moving cursor - content whose bottom rows are
+  //     static. Upload so those frames keep flowing (a decoder slower
+  //     than about one block per few presents also ends up here; at that
+  //     rate a frame takes seconds and an occasionally torn upload costs
+  //     less than freezing the video).
+  // The baseline is only kept for plane-sized surfaces (small 8-bit masks
+  // that legitimately contain all-zero rows keep uploading), and
+  // fh1_fmv_retain = false restores the always-upload behavior.
   constexpr size_t kFmvChunkBytes = 64;
   constexpr unsigned kFmvChunkCount = 5;
+  constexpr unsigned kFmvBoundaryRepeatUpload = 4;
   unsigned fmv_zero_chunks = 0;
   const bool fmv_probe = size_bytes >= kFmvChunkCount * kFmvChunkBytes;
   if (fmv_probe) {
@@ -1452,26 +1487,93 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
       fmv_zero_chunks += fmv_chunk_zero ? 1 : 0;
     }
   }
-  const bool fmv_snapshot_complete = fmv_zero_chunks == 0;
-  const bool fmv_snapshot_partial =
-      fmv_probe && fmv_zero_chunks > 0 && fmv_zero_chunks < kFmvChunkCount;
   const bool fmv_plane_sized = key.GetWidth() >= 320 && key.GetHeight() >= 180;
-  if (fmv_snapshot_complete) {
-    vulkan_texture.set_holds_complete_video_frame(true);
-  } else if (fmv_snapshot_partial && vulkan_texture.holds_complete_video_frame() &&
-             fmv_plane_sized && REXCVAR_GET(fh1_fmv_retain)) {
-    vulkan_texture.MarkAsUsed();
-    static std::atomic<uint32_t> fmv_retained_frames{0};
-    const uint32_t fmv_retained = fmv_retained_frames.fetch_add(1, std::memory_order_relaxed);
-    if (fmv_retained % 32 == 0) {
-      REXGPU_INFO("fh1 fmv incomplete plane snapshot retained last complete frame: "
-                  "{:08X} {}x{} bytes {} zero chunks {}/{}",
-                  key.base_page << 12, key.GetWidth(), key.GetHeight(), size_bytes,
-                  fmv_zero_chunks, kFmvChunkCount);
+  const bool fmv_retention_active = fmv_plane_sized && REXCVAR_GET(fh1_fmv_retain);
+  // Whether the snapshot being uploaded below becomes the new baseline. Any
+  // plane-sized upload establishes it (including a partial or all-zero
+  // first snapshot): the zero-chunk probe can never mark a letterboxed
+  // plane complete (its bottom black bar always holds a zero chunk), and
+  // the diff classification self-corrects from a torn baseline as soon as
+  // one fully rewritten snapshot arrives.
+  bool fmv_baseline_refresh = fmv_retention_active;
+  if (fmv_retention_active && vulkan_texture.has_video_frame_baseline(size_bytes)) {
+    constexpr unsigned kFmvDiffBlockTarget = 128;
+    constexpr size_t kFmvDiffBlockBytesMin = 64;
+    const size_t fmv_block_bytes = std::max<size_t>(
+        kFmvDiffBlockBytesMin,
+        (size_bytes + kFmvDiffBlockTarget - 1) / kFmvDiffBlockTarget);
+    const unsigned fmv_block_count =
+        unsigned((size_bytes + fmv_block_bytes - 1) / fmv_block_bytes);
+    const uint8_t* fmv_baseline = vulkan_texture.video_frame_baseline();
+    unsigned fmv_changed_low = 0;
+    bool fmv_changed = false;
+    for (unsigned fmv_block = 0; fmv_block < fmv_block_count; ++fmv_block) {
+      const size_t fmv_offset = size_t(fmv_block) * fmv_block_bytes;
+      const size_t fmv_length = std::min(fmv_block_bytes, size_bytes - fmv_offset);
+      if (std::memcmp(staging_mapping + fmv_offset, fmv_baseline + fmv_offset,
+                      fmv_length)) {
+        fmv_changed = true;
+        fmv_changed_low = fmv_block;
+      }
     }
-    return true;
-  } else {
-    vulkan_texture.set_holds_complete_video_frame(false);
+    if (!fmv_changed) {
+      // Byte-identical to the frame the texture already shows; the upload
+      // would be a visual no-op.
+      vulkan_texture.MarkAsUsed();
+      static std::atomic<uint32_t> fmv_static_frames{0};
+      const uint32_t fmv_static = fmv_static_frames.fetch_add(1, std::memory_order_relaxed);
+      if (fmv_static % 128 == 0) {
+        REXGPU_INFO("fh1 fmv snapshot identical to the uploaded frame, skipped: {:08X} "
+                    "{}x{} bytes {}",
+                    key.base_page << 12, key.GetWidth(), key.GetHeight(), size_bytes);
+      }
+      return true;
+    }
+    const bool fmv_reaches_bottom = fmv_changed_low + 1 == fmv_block_count;
+    bool fmv_tail_zero = true;
+    if (!fmv_reaches_bottom) {
+      for (unsigned fmv_block = fmv_changed_low + 1;
+           fmv_block < fmv_block_count && fmv_tail_zero; ++fmv_block) {
+        const size_t fmv_offset = size_t(fmv_block) * fmv_block_bytes;
+        const size_t fmv_length = std::min(fmv_block_bytes, size_bytes - fmv_offset);
+        for (size_t fmv_byte = 0; fmv_byte < fmv_length; ++fmv_byte) {
+          if (staging_mapping[fmv_offset + fmv_byte]) {
+            fmv_tail_zero = false;
+            break;
+          }
+        }
+      }
+    }
+    if (fmv_reaches_bottom || fmv_tail_zero) {
+      // Fully rewritten plane, or complete frame with legitimately black
+      // bottom rows: upload and make it the new baseline.
+      fmv_baseline_refresh = true;
+    } else {
+      const bool fmv_boundary_moved =
+          fmv_changed_low != vulkan_texture.video_frame_boundary_block();
+      vulkan_texture.note_video_frame_boundary(fmv_changed_low, fmv_boundary_moved);
+      if (fmv_boundary_moved ||
+          vulkan_texture.video_frame_boundary_repeats() < kFmvBoundaryRepeatUpload) {
+        // Torn mid-rewrite snapshot with a descending cursor: keep the
+        // last complete frame on the texture.
+        vulkan_texture.MarkAsUsed();
+        static std::atomic<uint32_t> fmv_retained_frames{0};
+        const uint32_t fmv_retained =
+            fmv_retained_frames.fetch_add(1, std::memory_order_relaxed);
+        if (fmv_retained % 32 == 0) {
+          REXGPU_INFO("fh1 fmv torn snapshot retained last complete frame: {:08X} {}x{} "
+                      "boundary {}/{} repeats {}",
+                      key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_changed_low,
+                      fmv_block_count, vulkan_texture.video_frame_boundary_repeats());
+        }
+        return true;
+      }
+      // The boundary stopped moving: static bottom rows, not a cursor.
+      fmv_baseline_refresh = true;
+    }
+  }
+  if (fmv_baseline_refresh) {
+    vulkan_texture.set_video_frame_baseline(staging_mapping, size_bytes);
   }
   if (REXCVAR_GET(fh1_fmv_debug)) {
     static std::atomic<uint32_t> fmv_debug_loads{0};
