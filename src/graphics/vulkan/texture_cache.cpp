@@ -1335,6 +1335,10 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   // snapshot races the video decoder rewriting the planes - on Adreno 660
   // (Turnip) this tore the FMV output into a repeated top band with stale or
   // zeroed rows below, and interleaved rows of different frames.
+  // Vulkan additionally retains the last complete frame across incomplete
+  // snapshots (see the completeness probe below); the Direct3D 12 path
+  // keeps uploading best-effort because desktop hosts rarely starve the
+  // decoder.
   if (!load_base || load_mips || resolve_sourced) {
     return false;
   }
@@ -1399,32 +1403,62 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
     }
     return false;
   }
+  // Snapshot completeness probe (always on): the decoder rewrites the plane
+  // top to bottom, so zero chunks mean the load caught the plane before the
+  // frame finished arriving - a starved decoder presents those partial
+  // frames as black video with a partial top strip while the audio keeps
+  // playing (build #37 evidence). When the texture already holds a complete
+  // frame, skip such incomplete snapshots and keep presenting the last
+  // complete frame: the memory watch stays armed, so the decoder's next
+  // write re-outdates the plane and the following draw retries the load.
+  // The retention only applies to plane-sized surfaces (small 8-bit masks
+  // that legitimately contain all-zero rows still upload), and a texture
+  // that has never held a complete frame is always refreshed best-effort,
+  // so a letterboxed video (bottom rows always zero) never freezes.
+  constexpr size_t kFmvChunkBytes = 64;
+  constexpr unsigned kFmvChunkCount = 5;
+  unsigned fmv_zero_chunks = 0;
+  if (size_bytes >= kFmvChunkCount * kFmvChunkBytes) {
+    for (unsigned fmv_chunk = 0; fmv_chunk < kFmvChunkCount; ++fmv_chunk) {
+      const size_t fmv_offset =
+          std::min((size_t(fmv_chunk) * size_bytes) / kFmvChunkCount,
+                   size_bytes - kFmvChunkBytes);
+      const uint8_t* fmv_data = staging_mapping + fmv_offset;
+      bool fmv_chunk_zero = true;
+      for (size_t fmv_byte = 0; fmv_byte < kFmvChunkBytes; ++fmv_byte) {
+        if (fmv_data[fmv_byte]) {
+          fmv_chunk_zero = false;
+          break;
+        }
+      }
+      fmv_zero_chunks += fmv_chunk_zero ? 1 : 0;
+    }
+  }
+  const bool fmv_snapshot_complete = fmv_zero_chunks == 0;
+  const bool fmv_plane_sized = key.GetWidth() >= 320 && key.GetHeight() >= 180;
+  if (fmv_snapshot_complete) {
+    vulkan_texture.set_holds_complete_video_frame(true);
+  } else if (vulkan_texture.holds_complete_video_frame() && fmv_plane_sized) {
+    vulkan_texture.MarkAsUsed();
+    static std::atomic<uint32_t> fmv_retained_frames{0};
+    const uint32_t fmv_retained = fmv_retained_frames.fetch_add(1, std::memory_order_relaxed);
+    if (fmv_retained % 32 == 0) {
+      REXGPU_INFO("fh1 fmv incomplete plane snapshot retained last complete frame: "
+                  "{:08X} {}x{} bytes {} zero chunks {}/{}",
+                  key.base_page << 12, key.GetWidth(), key.GetHeight(), size_bytes,
+                  fmv_zero_chunks, kFmvChunkCount);
+    }
+    return true;
+  } else {
+    vulkan_texture.set_holds_complete_video_frame(false);
+  }
   if (REXCVAR_GET(fh1_fmv_debug)) {
-    // Snapshot completeness probe: the decoder rewrites the plane top to
-    // bottom, so all-zero chunks mean the load caught the plane before the
-    // frame finished arriving - the game presents those as black video frames
-    // with a partial top strip. Rate-limited to every 30th load.
     static std::atomic<uint32_t> fmv_debug_loads{0};
     const uint32_t fmv_debug_index = fmv_debug_loads.fetch_add(1, std::memory_order_relaxed);
-    if (fmv_debug_index % 30 == 0 && size_bytes >= 64) {
-      constexpr size_t kFmvDebugChunk = 64;
-      unsigned fmv_debug_zero_chunks = 0;
-      for (unsigned fmv_debug_i = 0; fmv_debug_i < 5; ++fmv_debug_i) {
-        const size_t fmv_debug_offset = std::min(
-            (size_t(fmv_debug_i) * size_bytes) / 5, size_bytes - kFmvDebugChunk);
-        const uint8_t* fmv_debug_data = staging_mapping + fmv_debug_offset;
-        bool fmv_debug_all_zero = true;
-        for (size_t fmv_debug_j = 0; fmv_debug_j < kFmvDebugChunk; ++fmv_debug_j) {
-          if (fmv_debug_data[fmv_debug_j]) {
-            fmv_debug_all_zero = false;
-            break;
-          }
-        }
-        fmv_debug_zero_chunks += fmv_debug_all_zero ? 1 : 0;
-      }
-      REXGPU_INFO("fh1 fmv plane load #{}: {:08X} {}x{} pitch {} bytes {} zero chunks {}/5",
+    if (fmv_debug_index % 30 == 0) {
+      REXGPU_INFO("fh1 fmv plane load #{}: {:08X} {}x{} pitch {} bytes {} zero chunks {}/{}",
                   fmv_debug_index, key.base_page << 12, key.GetWidth(), key.GetHeight(),
-                  guest.row_pitch_bytes, size_bytes, fmv_debug_zero_chunks);
+                  guest.row_pitch_bytes, size_bytes, fmv_zero_chunks, kFmvChunkCount);
     }
   }
   vulkan_texture.MarkAsUsed();

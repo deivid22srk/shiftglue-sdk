@@ -229,6 +229,14 @@ class VulkanTextureCache final : public TextureCache {
     void set_copy_words(uint32_t words) { copy_words_ = words; }
     VkImageView GetCopyView();
 
+    // Fast-path CPU video plane loads: whether the last uploaded snapshot
+    // was a complete frame. Incomplete snapshots (the guest decoder still
+    // rewriting the plane top to bottom) are skipped while a complete frame
+    // is already present, so a starved decoder presents the last complete
+    // frame instead of black video.
+    bool holds_complete_video_frame() const { return holds_complete_video_frame_; }
+    void set_holds_complete_video_frame(bool holds) { holds_complete_video_frame_ = holds; }
+
    private:
     union ViewKey {
       uint32_t key;
@@ -283,6 +291,8 @@ class VulkanTextureCache final : public TextureCache {
     VkImageView copy_view_ = VK_NULL_HANDLE;
 
     Usage usage_ = Usage::kUndefined;
+
+    bool holds_complete_video_frame_ = false;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     // The last view returned per signedness, by its GetView arguments: a
