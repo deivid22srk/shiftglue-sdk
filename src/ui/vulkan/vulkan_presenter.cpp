@@ -49,7 +49,12 @@
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
-REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
+// Off on Android by default: the surface goes through the platform
+// compositor, and IMMEDIATE can present mid-scanout there (visible tearing
+// during FMV playback). MAILBOX, preferred next, is tear-free while still
+// dropping late frames. Explicitly setting the cvar to true restores the
+// old behavior for testing.
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, !REX_PLATFORM_ANDROID, "UI/Vulkan",
                     "Allow immediate present mode (no vsync)");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
