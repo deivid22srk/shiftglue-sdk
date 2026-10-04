@@ -239,9 +239,13 @@ class VulkanTextureCache final : public TextureCache {
     // new snapshot is diffed against the baseline: a changed prefix with an
     // unchanged non-zero tail whose boundary moved since the previous
     // snapshot is a decode in progress, and the last complete frame is
-    // retained on the texture instead of uploading the torn one. Gated by
-    // the fh1_fmv_retain cvar; only plane-sized surfaces keep a baseline,
-    // so small 8-bit masks keep uploading as before.
+    // retained on the texture instead of uploading the torn one. The same
+    // applies to a changed middle band with an unchanged all-zero tail when
+    // the baseline above the band holds frame content (the first frame
+    // decoded into cleared planes, rewritten top to bottom while the tail
+    // below the cursor is still zero). Gated by the fh1_fmv_retain cvar;
+    // only plane-sized surfaces keep a baseline, so small 8-bit masks keep
+    // uploading as before.
     bool has_video_frame_baseline(size_t size_bytes) const {
       return video_frame_baseline_.size() == size_bytes;
     }

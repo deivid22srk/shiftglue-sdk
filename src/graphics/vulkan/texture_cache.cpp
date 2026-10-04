@@ -1451,10 +1451,19 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
   //     already shows (a re-published frame, paused video) - skip the
   //     upload entirely.
   //   - changes reach the last block: a fully rewritten plane - upload.
-  //   - the unchanged tail below the lowest changed block is all zero: a
-  //     complete frame whose bottom rows are legitimately black (a
+  //   - the unchanged tail below the lowest changed block is all zero:
+  //     a complete frame whose bottom rows are legitimately black (a
   //     letterbox bar, a fade) - upload; a torn snapshot caught inside a
   //     bottom black bar is visually identical to the complete frame.
+  //     Except when the changed region is a MIDDLE band (rows above it
+  //     match the baseline) and the baseline above the band holds frame
+  //     content: that is the decoder cursor descending over rows it has
+  //     already written this frame while the never-written tail below is
+  //     still zero (the very first frame after the planes are cleared,
+  //     build #37 evidence: a partial top strip on black that kept
+  //     growing snapshot by snapshot because every upload re-baselined
+  //     it) - retain the last complete frame instead of uploading the
+  //     partial one (see the zero-tail classification below).
   //   - the unchanged tail is non-zero stale content and the changed
   //     prefix boundary MOVED since the previous snapshot: the decoder
   //     cursor is descending mid-rewrite - retain the last complete frame
@@ -1511,12 +1520,16 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
         unsigned((size_bytes + fmv_block_bytes - 1) / fmv_block_bytes);
     const uint8_t* fmv_baseline = vulkan_texture.video_frame_baseline();
     unsigned fmv_changed_low = 0;
+    unsigned fmv_changed_high = 0;
     bool fmv_changed = false;
     for (unsigned fmv_block = 0; fmv_block < fmv_block_count; ++fmv_block) {
       const size_t fmv_offset = size_t(fmv_block) * fmv_block_bytes;
       const size_t fmv_length = std::min(fmv_block_bytes, size_bytes - fmv_offset);
       if (std::memcmp(staging_mapping + fmv_offset, fmv_baseline + fmv_offset,
                       fmv_length)) {
+        if (!fmv_changed) {
+          fmv_changed_high = fmv_block;
+        }
         fmv_changed = true;
         fmv_changed_low = fmv_block;
       }
@@ -1549,10 +1562,52 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
         }
       }
     }
-    if (fmv_reaches_bottom || fmv_tail_zero) {
-      // Fully rewritten plane, or complete frame with legitimately black
-      // bottom rows: upload and make it the new baseline.
+    if (fmv_reaches_bottom) {
+      // Fully rewritten plane: upload and make it the new baseline.
       fmv_baseline_refresh = true;
+    } else if (fmv_tail_zero) {
+      // The unchanged tail below the lowest changed block is all zero.
+      // A changed prefix (frame content starting at row 0) is a normal
+      // frame update whose bottom rows are legitimately black (a bottom
+      // letterbox bar, a fade) - upload it.
+      // A changed middle band means the rows above it are byte-identical
+      // to the baseline. Two cases produce that: the plane's top holds a
+      // static zero bar (the baseline above the band is zero too - a top
+      // letterbox bar, upload), or the decoder cursor is descending over
+      // rows it has already written this frame while the tail below has
+      // never been written (the first frame after the planes are cleared
+      // - the partial top strip on black of build #37, whose growing
+      // uploads were the colored band on the title screen). Any non-zero
+      // baseline byte above the band distinguishes the decoder case:
+      // that region is the already-uploaded beginning of the current
+      // frame, not a static bar. Retain the last complete frame there;
+      // the completion of the rewrite reaches the bottom and uploads
+      // through the reaches-bottom branch. A decoder frozen mid-rewrite
+      // never gets here - its snapshot is byte-identical to the baseline
+      // and is skipped earlier.
+      bool fmv_static_zero_top = true;
+      const size_t fmv_band_start = size_t(fmv_changed_high) * fmv_block_bytes;
+      for (size_t fmv_byte = 0; fmv_byte < fmv_band_start && fmv_static_zero_top;
+           ++fmv_byte) {
+        if (fmv_baseline[fmv_byte]) {
+          fmv_static_zero_top = false;
+        }
+      }
+      if (fmv_static_zero_top) {
+        fmv_baseline_refresh = true;
+      } else {
+        vulkan_texture.MarkAsUsed();
+        static std::atomic<uint32_t> fmv_retained_zero_tail_frames{0};
+        const uint32_t fmv_retained_zero_tail =
+            fmv_retained_zero_tail_frames.fetch_add(1, std::memory_order_relaxed);
+        if (fmv_retained_zero_tail % 32 == 0) {
+          REXGPU_INFO("fh1 fmv partial snapshot with zero tail retained last complete "
+                      "frame: {:08X} {}x{} band {}/{} bytes {}",
+                      key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_changed_high,
+                      fmv_changed_low, size_bytes);
+        }
+        return true;
+      }
     } else {
       const bool fmv_boundary_moved =
           fmv_changed_low != vulkan_texture.video_frame_boundary_block();
