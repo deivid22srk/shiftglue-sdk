@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <type_traits>
 #include <climits>
 #include <cstdint>
 #include <condition_variable>
@@ -266,6 +267,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   // Without a value, the current draw index in the frame.
   void Checkpoint(CheckpointKind kind, uint32_t value = UINT32_MAX, std::string detail = {});
+  // The per-draw hot path: records the draw with its binary identity (shader
+  // ucode hashes) and NO string formatting on the recording thread.
+  void CheckpointDraw(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash);
+  // Records the resolved pipeline identity right before the pipeline bind,
+  // also without formatting on the recording thread.
+  void NoteDrawBind(uint64_t render_pass_key, uint64_t pipeline_handle);
   bool checkpoints_enabled() const { return checkpoints_enabled_; }
   // True when either diagnostic trail is recording: the NV checkpoints or the
   // universal breadcrumbs (Turnip). Call sites that build rich per-draw
@@ -443,10 +450,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   static void BreadcrumbLossDump();
   bool checkpoints_enabled_ = false;
   // What each recent checkpoint serial was, for the device-loss report.
-  // detail is a fixed buffer, not a std::string: the recording thread writes
-  // one record per draw while a device-loss dump on another thread (the
+  // detail is a fixed buffer and the draw identity is binary (no std::string,
+  // no formatting in the per-draw hot path): the recording thread writes one
+  // to three records per draw while a device-loss dump on another thread (the
   // presenter's loss callback) reads the ring - a torn POD read yields
-  // garbage text, a torn std::string read yields a crash inside the dump.
+  // garbage values, a torn std::string read yields a crash inside the dump.
   // The serial is atomic so the dump's loop bounds are always valid values.
   struct CheckpointRecord {
     static constexpr size_t kDetailBytes = 128;
@@ -454,8 +462,16 @@ class VulkanCommandProcessor : public CommandProcessor {
     CheckpointKind kind = CheckpointKind::kDraw;
     uint32_t frame = 0;
     uint32_t value = 0;
+    // Draw identity, set by CheckpointDraw/NoteDrawBind; 0 when absent. The
+    // dump formats these once at loss time instead of every draw paying
+    // fmt::format on the recording thread.
+    uint64_t vertex_shader_hash = 0;
+    uint64_t pixel_shader_hash = 0;
+    uint64_t render_pass_key = 0;
+    uint64_t pipeline_handle = 0;
     char detail[kDetailBytes] = {};
   };
+  static_assert(std::is_trivially_copyable_v<CheckpointRecord>);
   static constexpr size_t kCheckpointRecords = size_t(1) << 16;
   std::vector<CheckpointRecord> checkpoint_records_;
   std::atomic<uint64_t> checkpoint_serial_{0};

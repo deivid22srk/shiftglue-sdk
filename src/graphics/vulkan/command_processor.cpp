@@ -4422,14 +4422,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       return draw_fail("begin_submission");
     }
     if (checkpoints_enabled_ || breadcrumbs_enabled_) {
-      // Early per-draw marker: the ucode hashes identify the shaders; the
-      // render target / pipeline identity follows later (after target
-      // binding resolves the pass key) as a note.
-      Checkpoint(CheckpointKind::kDraw, UINT32_MAX,
-                 fmt::format("vs {:016X} ps {:016X} primitive {} indices {}",
-                             vertex_shader->ucode_data_hash(),
-                             pixel_shader ? pixel_shader->ucode_data_hash() : 0,
-                             uint32_t(prim_type), index_count));
+      // Early per-draw marker with the binary shader identity (no formatting
+      // on this hot path - up to three records per draw); the render target
+      // and pipeline identity follow after target binding as NoteDrawBind.
+      CheckpointDraw(vertex_shader->ucode_data_hash(),
+                     pixel_shader ? pixel_shader->ucode_data_hash() : 0);
     }
 
     // Process primitives.
@@ -4766,10 +4763,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (checkpoints_enabled_ || breadcrumbs_enabled_) {
     // The full draw identity for device-loss reports: the bound render
     // target combination (pass key) and the resolved guest pipeline handle,
-    // recorded right before the pipeline is bound.
-    NoteCheckpoint(fmt::format("draw bind pass {:016X} pipe {:016X}",
-                               pipeline_render_pass_key.key,
-                               uint64_t(uintptr_t(pipeline_handle))));
+    // recorded right before the pipeline is bound, without formatting.
+    NoteDrawBind(pipeline_render_pass_key.key, uint64_t(uintptr_t(pipeline_handle)));
   }
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -6574,9 +6569,57 @@ void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
   record.kind = CheckpointKind::kNote;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = debug_frame_draw_index_ - 1;
+  record.vertex_shader_hash = 0;
+  record.pixel_shader_hash = 0;
+  record.render_pass_key = 0;
+  record.pipeline_handle = 0;
   const size_t detail_bytes = std::min(detail.size(), CheckpointRecord::kDetailBytes - 1);
   std::memcpy(record.detail, detail.data(), detail_bytes);
   record.detail[detail_bytes] = '\0';
+}
+
+void VulkanCommandProcessor::CheckpointDraw(uint64_t vertex_shader_hash,
+                                            uint64_t pixel_shader_hash) {
+  if (!checkpoints_enabled_ && !breadcrumbs_enabled_) {
+    return;
+  }
+  const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
+  CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+  record.serial = serial;
+  record.kind = CheckpointKind::kDraw;
+  record.frame = uint32_t(observation_frame_sequence_);
+  record.value = debug_frame_draw_index_ - 1;
+  record.vertex_shader_hash = vertex_shader_hash;
+  record.pixel_shader_hash = pixel_shader_hash;
+  record.render_pass_key = 0;
+  record.pipeline_handle = 0;
+  record.detail[0] = '\0';
+  if (checkpoints_enabled_) {
+    deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
+  } else if (breadcrumb_buffer_ != VK_NULL_HANDLE &&
+             !deferred_command_buffer_.IsRecordingInsideRenderPass()) {
+    deferred_command_buffer_.CmdVkFillBuffer(
+        breadcrumb_buffer_, VkDeviceSize((serial % kBreadcrumbSlots) * 4), 4,
+        uint32_t(serial));
+  }
+}
+
+void VulkanCommandProcessor::NoteDrawBind(uint64_t render_pass_key,
+                                           uint64_t pipeline_handle) {
+  if (!checkpoints_enabled_ && !breadcrumbs_enabled_) {
+    return;
+  }
+  const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
+  CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+  record.serial = serial;
+  record.kind = CheckpointKind::kNote;
+  record.frame = uint32_t(observation_frame_sequence_);
+  record.value = debug_frame_draw_index_ - 1;
+  record.vertex_shader_hash = 0;
+  record.pixel_shader_hash = 0;
+  record.render_pass_key = render_pass_key;
+  record.pipeline_handle = pipeline_handle;
+  record.detail[0] = '\0';
 }
 
 void VulkanCommandProcessor::LogCheckpoints() {
@@ -6596,15 +6639,29 @@ void VulkanCommandProcessor::LogCheckpoints() {
                                          "texture load", "resolve",     "transfer",
                                          "clear",        "draw end",    "texture load end",
                                          "note"};
+    // Snapshot the POD record first, then re-check the serial: if the slot
+    // was recycled mid-copy the read is torn and the record is dropped as
+    // such instead of reporting another draw's identity as this one's.
     auto describe = [&](uint64_t serial) {
-      const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
-      if (record.serial != serial) {
+      CheckpointRecord snapshot =
+          checkpoint_records_[serial & (kCheckpointRecords - 1)];
+      if (snapshot.serial != serial ||
+          checkpoint_records_[serial & (kCheckpointRecords - 1)].serial != snapshot.serial) {
         return fmt::format("#{} (no longer recorded)", serial);
       }
-      const uint32_t kind = uint32_t(record.kind);
-      return fmt::format("#{} {} {} (frame {}) {}", serial,
-                         kind < std::size(kKinds) ? kKinds[kind] : "?", record.value,
-                         record.frame, record.detail);
+      const uint32_t kind = uint32_t(snapshot.kind);
+      std::string identity;
+      if (snapshot.vertex_shader_hash || snapshot.pixel_shader_hash) {
+        identity += fmt::format(" vs {:016X} ps {:016X}", snapshot.vertex_shader_hash,
+                                snapshot.pixel_shader_hash);
+      }
+      if (snapshot.render_pass_key || snapshot.pipeline_handle) {
+        identity += fmt::format(" pass {:016X} pipe {:016X}", snapshot.render_pass_key,
+                                snapshot.pipeline_handle);
+      }
+      return fmt::format("#{} {} {} (frame {}){}{}", serial,
+                         kind < std::size(kKinds) ? kKinds[kind] : "?", snapshot.value,
+                         snapshot.frame, identity, snapshot.detail);
     };
     uint32_t gpu_reached = 0;
     if (breadcrumb_mapped_) {
@@ -6663,15 +6720,26 @@ void VulkanCommandProcessor::LogCheckpoints() {
   static const char* const kKinds[] = {"?",        "draw",     "copy",     "texture load",
                                        "resolve",  "transfer", "clear",    "draw end",
                                        "texture load end", "note"};
+  // Same POD-snapshot discipline as the breadcrumb dump above.
   auto describe = [&](uint64_t serial) {
-    const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
-    if (record.serial != serial) {
+    CheckpointRecord snapshot = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+    if (snapshot.serial != serial ||
+        checkpoint_records_[serial & (kCheckpointRecords - 1)].serial != snapshot.serial) {
       return fmt::format("#{} (no longer recorded)", serial);
     }
-    const uint32_t kind = uint32_t(record.kind);
-    return fmt::format("#{} {} {} (frame {}) {}", serial,
-                       kind < std::size(kKinds) ? kKinds[kind] : "?", record.value,
-                       record.frame, record.detail);
+    const uint32_t kind = uint32_t(snapshot.kind);
+    std::string identity;
+    if (snapshot.vertex_shader_hash || snapshot.pixel_shader_hash) {
+      identity += fmt::format(" vs {:016X} ps {:016X}", snapshot.vertex_shader_hash,
+                              snapshot.pixel_shader_hash);
+    }
+    if (snapshot.render_pass_key || snapshot.pipeline_handle) {
+      identity += fmt::format(" pass {:016X} pipe {:016X}", snapshot.render_pass_key,
+                              snapshot.pipeline_handle);
+    }
+    return fmt::format("#{} {} {} (frame {}){}{}", serial,
+                       kind < std::size(kKinds) ? kKinds[kind] : "?", snapshot.value,
+                       snapshot.frame, identity, snapshot.detail);
   };
   uint64_t finished = 0, begun = 0;
   const uint64_t serial_now = checkpoint_serial_.load(std::memory_order_relaxed);
@@ -8298,11 +8366,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   if ((checkpoints_enabled_ || breadcrumbs_enabled_) && write_pixel_textures &&
       texture_count_pixel) {
+    // First eight bindings carry the identity, the count the rest; building a
+    // formatted entry per texture per rebind is measurable on the recording
+    // thread when the note runs with breadcrumbs.
     std::string views;
-    for (uint32_t i = 0; i < texture_count_pixel; ++i) {
+    const uint32_t views_logged = std::min(texture_count_pixel, 8u);
+    for (uint32_t i = 0; i < views_logged; ++i) {
       views += fmt::format(" t{}={:X}", (*textures_pixel)[i].fetch_constant,
                            uint64_t(descriptor_write_image_info_[pixel_texture_image_info_offset + i]
                                         .imageView));
+    }
+    if (texture_count_pixel > views_logged) {
+      views += fmt::format(" (+{} more)", texture_count_pixel - views_logged);
     }
     NoteCheckpoint("pixel textures" + views);
   }
