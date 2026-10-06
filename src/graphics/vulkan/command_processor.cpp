@@ -2840,7 +2840,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         fmt::format("packet {}x{} src {}x{} fmt 16_16_16_16", frontbuffer_width,
                     frontbuffer_height, frontbuffer_width_unscaled, frontbuffer_height_unscaled);
     if (swap_logged.insert(swap_signature).second) {
-      REXGPU_INFO("FH1 FMV presentation swap: {}", swap_signature);
+      REXGPU_INFO("fh1 fmv presentation swap: {}", swap_signature);
     }
   }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
@@ -4421,7 +4421,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
     }
-    if (checkpoints_enabled_) {
+    if (checkpoints_enabled_ || breadcrumbs_enabled_) {
+      // Early per-draw marker: the ucode hashes identify the shaders; the
+      // render target / pipeline identity follows later (after target
+      // binding resolves the pass key) as a note.
       Checkpoint(CheckpointKind::kDraw, UINT32_MAX,
                  fmt::format("vs {:016X} ps {:016X} primitive {} indices {}",
                              vertex_shader->ucode_data_hash(),
@@ -4740,21 +4743,33 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
     frame_async_placeholder_draws_++;
-    if (REXCVAR_GET(vulkan_frame_stats)) {
-      // Which pipeline is still warming: the guest pipeline handle and the
-      // vertex/pixel ucode hashes identify the permutation, so the log
-      // points at the shader the device spent its compile budget on.
-      REXGPU_WARN(
-          "draw skipped, pipeline still warming (frame {}, draw {}, handle {:016X}, "
-          "vs {:016X}, ps {:016X})",
-          frame_current_, debug_frame_draw_index_, uint64_t(uintptr_t(pipeline_handle)),
-          vertex_shader->ucode_data_hash(),
-          pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    if (frame_async_placeholder_draws_ <= 8) {
+      if (REXCVAR_GET(vulkan_frame_stats)) {
+        // Which pipeline is still warming: the guest pipeline handle and the
+        // vertex/pixel ucode hashes identify the permutation, so the log
+        // points at the shader the device spent its compile budget on. The
+        // first eight of a frame carry the identity; the frame summary line
+        // carries the total.
+        REXGPU_WARN(
+            "draw skipped, pipeline still warming (frame {}, draw {}, handle {:016X}, "
+            "vs {:016X}, ps {:016X})",
+            frame_current_, debug_frame_draw_index_, uint64_t(uintptr_t(pipeline_handle)),
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+      }
     }
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
+  }
+  if (checkpoints_enabled_ || breadcrumbs_enabled_) {
+    // The full draw identity for device-loss reports: the bound render
+    // target combination (pass key) and the resolved guest pipeline handle,
+    // recorded right before the pipeline is bound.
+    NoteCheckpoint(fmt::format("draw bind pass {:016X} pipe {:016X}",
+                               pipeline_render_pass_key.key,
+                               uint64_t(uintptr_t(pipeline_handle))));
   }
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -5937,10 +5952,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (fence_status != VK_SUCCESS) {
       if (fence_status == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
-      } else if (fence_status != VK_NOT_READY) {
-        // A zero-timeout poll reports an unsignaled fence as VK_NOT_READY;
-        // anything else is a real error the submission completion path
-        // previously swallowed silently.
+      } else if (fence_status != VK_TIMEOUT) {
+        // A zero-timeout vkWaitForFences reports an unsignaled fence as
+        // VK_TIMEOUT (VK_NOT_READY is vkGetFenceStatus's wording); anything
+        // else is a real error the submission completion path previously
+        // swallowed silently.
         REXGPU_ERROR("Failed to poll submission completion Vulkan fence: VkResult {}",
                      int32_t(fence_status));
       }
@@ -6401,11 +6417,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     LogMemoryBudget();
     if (REXCVAR_GET(vulkan_frame_stats)) {
       // frame_current_ was just incremented above; the closed frame is one
-      // less.
-      REXGPU_INFO("vulkan frame {} closed: {} draws, {} submissions, {} placeholder draws",
+      // less. Texture counters are Take-reset here (this thread is the only
+      // creator and reader).
+      REXGPU_INFO("vulkan frame {} closed: {} draws, {} submissions, {} placeholder draws, "
+                  "{} textures created, {} texture create failures",
                   frame_current_ - 1, debug_frame_draw_index_ - frame_first_draw_index_,
                   GetCurrentSubmission() - frame_first_submission_,
-                  frame_async_placeholder_draws_);
+                  frame_async_placeholder_draws_,
+                  texture_cache_->TakeFrameTextureCreations(),
+                  texture_cache_->TakeFrameTextureCreateFailures());
     }
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
@@ -6518,13 +6538,15 @@ void VulkanCommandProcessor::Checkpoint(CheckpointKind kind, uint32_t value,
   if (value == UINT32_MAX) {
     value = debug_frame_draw_index_ - 1;
   }
-  const uint64_t serial = ++checkpoint_serial_;
+  const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
   CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
   record.serial = serial;
   record.kind = kind;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = value;
-  record.detail = std::move(detail);
+  const size_t detail_bytes = std::min(detail.size(), CheckpointRecord::kDetailBytes - 1);
+  std::memcpy(record.detail, detail.data(), detail_bytes);
+  record.detail[detail_bytes] = '\0';
   if (checkpoints_enabled_) {
     deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
   } else if (breadcrumb_buffer_ != VK_NULL_HANDLE &&
@@ -6546,13 +6568,15 @@ void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
   if (!checkpoints_enabled_ && !breadcrumbs_enabled_) {
     return;
   }
-  const uint64_t serial = ++checkpoint_serial_;
+  const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
   CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
   record.serial = serial;
   record.kind = CheckpointKind::kNote;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = debug_frame_draw_index_ - 1;
-  record.detail = std::move(detail);
+  const size_t detail_bytes = std::min(detail.size(), CheckpointRecord::kDetailBytes - 1);
+  std::memcpy(record.detail, detail.data(), detail_bytes);
+  record.detail[detail_bytes] = '\0';
 }
 
 void VulkanCommandProcessor::LogCheckpoints() {
@@ -6565,7 +6589,9 @@ void VulkanCommandProcessor::LogCheckpoints() {
     // No NV checkpoints (Turnip/Mesa): dump from the breadcrumb trail
     // instead. The largest serial present in the mapped marker buffer is the
     // last work the GPU confirmed executing; the ring records after it were
-    // in flight or never reached - the suspects.
+    // in flight or never reached - the suspects. Line prefixes carry the
+    // word "breadcrumb" so the realtime sink routes the trail into
+    // vulkan.log and crash.log as well as all.log/gpu.log.
     static const char* const kKinds[] = {"?",           "draw",        "copy",
                                          "texture load", "resolve",     "transfer",
                                          "clear",        "draw end",    "texture load end",
@@ -6596,30 +6622,28 @@ void VulkanCommandProcessor::LogCheckpoints() {
         gpu_reached = std::max(gpu_reached, breadcrumb_mapped_[slot]);
       }
     }
+    const uint64_t serial_now = checkpoint_serial_.load(std::memory_order_relaxed);
     REXGPU_ERROR(
         "Vulkan device lost (breadcrumbs); GPU confirmed marker #{}, last recorded #{}:",
-        gpu_reached, checkpoint_serial_);
+        gpu_reached, serial_now);
     const uint64_t first = gpu_reached > 48 ? gpu_reached - 48 : 1;
     for (uint64_t serial = first; serial <= gpu_reached; ++serial) {
-      REXGPU_ERROR("  done: {}", describe(serial));
+      REXGPU_ERROR("breadcrumb done: {}", describe(serial));
     }
     // Pending records (never confirmed by the GPU): the suspects. At most the
     // last 64, the closest to the recording head.
     const uint64_t first_pending =
-        std::max<uint64_t>(gpu_reached + 1,
-                           checkpoint_serial_ > 64 ? checkpoint_serial_ - 64 : 1);
-    for (uint64_t serial = first_pending; serial <= checkpoint_serial_; ++serial) {
-      REXGPU_ERROR("  pending (suspect): {}", describe(serial));
+        std::max<uint64_t>(gpu_reached + 1, serial_now > 64 ? serial_now - 64 : 1);
+    for (uint64_t serial = first_pending; serial <= serial_now; ++serial) {
+      REXGPU_ERROR("breadcrumb pending (suspect): {}", describe(serial));
     }
     const uint64_t first_recorded =
-        checkpoint_serial_ >= kCheckpointRecords
-            ? checkpoint_serial_ - kCheckpointRecords + 1
-            : 1;
-    for (uint64_t serial = first_recorded; serial <= checkpoint_serial_; ++serial) {
+        serial_now >= kCheckpointRecords ? serial_now - kCheckpointRecords + 1 : 1;
+    for (uint64_t serial = first_recorded; serial <= serial_now; ++serial) {
       const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
       if (record.serial == serial && record.kind == CheckpointKind::kNote &&
-          record.detail.rfind("destroy", 0) == 0) {
-        REXGPU_ERROR("  destroyed: {}", describe(serial));
+          std::strncmp(record.detail, "destroy", 7) == 0) {
+        REXGPU_ERROR("breadcrumb destroyed: {}", describe(serial));
       }
     }
     return;
@@ -6650,8 +6674,9 @@ void VulkanCommandProcessor::LogCheckpoints() {
                        record.frame, record.detail);
   };
   uint64_t finished = 0, begun = 0;
+  const uint64_t serial_now = checkpoint_serial_.load(std::memory_order_relaxed);
   REXGPU_ERROR("Vulkan device lost; {} last checkpoints reached (last recorded #{}):", count,
-               checkpoint_serial_);
+               serial_now);
   for (uint32_t i = 0; i < count; ++i) {
     const uint64_t serial = uint64_t(uintptr_t(checkpoints[i].pCheckpointMarker));
     REXGPU_ERROR("  stage {:08X}: {}", uint32_t(checkpoints[i].stage), describe(serial));
@@ -6665,18 +6690,18 @@ void VulkanCommandProcessor::LogCheckpoints() {
       REXGPU_ERROR("  before: {}", describe(serial));
     }
     const uint64_t last = std::min(std::max(begun, finished + 24), finished + 64);
-    for (uint64_t serial = finished + 1; serial <= last && serial <= checkpoint_serial_;
+    for (uint64_t serial = finished + 1; serial <= last && serial <= serial_now;
          ++serial) {
       REXGPU_ERROR("  after: {}", describe(serial));
     }
     // Every texture destruction still recorded: a view that the unfinished
     // work uses may be among them.
     const uint64_t first_recorded =
-        checkpoint_serial_ >= kCheckpointRecords ? checkpoint_serial_ - kCheckpointRecords + 1 : 1;
-    for (uint64_t serial = first_recorded; serial <= checkpoint_serial_; ++serial) {
+        serial_now >= kCheckpointRecords ? serial_now - kCheckpointRecords + 1 : 1;
+    for (uint64_t serial = first_recorded; serial <= serial_now; ++serial) {
       const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
       if (record.serial == serial && record.kind == CheckpointKind::kNote &&
-          record.detail.rfind("destroy", 0) == 0) {
+          std::strncmp(record.detail, "destroy", 7) == 0) {
         REXGPU_ERROR("  destroyed: {}", describe(serial));
       }
     }
@@ -6729,7 +6754,7 @@ bool VulkanCommandProcessor::SetupBreadcrumbs() {
   memory_allocate_info.pNext = nullptr;
   memory_allocate_info.allocationSize = memory_requirements.size;
   memory_allocate_info.memoryTypeIndex = memory_type;
-  VkDeviceMemory memory;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
   if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS ||
       dfn.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
     REXGPU_WARN("VulkanCommandProcessor: could not allocate/bind the breadcrumb marker "
@@ -8271,7 +8296,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     last_texture_descriptor_sets_[1].set = write_textures[0].dstSet;
     last_texture_descriptor_sets_[1].frame = frame_current_;
   }
-  if (checkpoints_enabled_ && write_pixel_textures && texture_count_pixel) {
+  if ((checkpoints_enabled_ || breadcrumbs_enabled_) && write_pixel_textures &&
+      texture_count_pixel) {
     std::string views;
     for (uint32_t i = 0; i < texture_count_pixel; ++i) {
       views += fmt::format(" t{}={:X}", (*textures_pixel)[i].fetch_constant,

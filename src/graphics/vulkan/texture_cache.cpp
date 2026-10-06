@@ -1199,6 +1199,7 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   }
   if (formats[0] == VK_FORMAT_UNDEFINED) {
     unsupported_format_features_used_[uint32_t(key.format)] |= kUnsupportedResourceBit;
+    ++frame_texture_create_failures_;
     return nullptr;
   }
 
@@ -1306,11 +1307,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
         key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
         uint32_t(GetHostFormatPair(key).format_unsigned.format), unsigned(key.mip_max_level) + 1,
         key.base_page << 12);
+    ++frame_texture_create_failures_;
     return nullptr;
   }
 
   auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
   texture->set_copy_words(copy_words);
+  ++frame_texture_creations_;
   if (REXCVAR_GET(vulkan_texture_log)) {
     // One line per created texture, with everything needed to correlate a
     // broken surface on device with the guest resource behind it: guest
@@ -1845,7 +1848,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                                                                  bool load_base, bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
-  if (command_processor_.checkpoints_enabled()) {
+  if (command_processor_.recording_checkpoints()) {
     command_processor_.Checkpoint(
         VulkanCommandProcessor::CheckpointKind::kTextureLoad, texture_key.base_page,
         fmt::format("format {} dimension {} {}x{}x{} pitch {} tiled {} scaled {} mips {} "
@@ -2577,7 +2580,7 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  if (vulkan_texture_cache.command_processor_.checkpoints_enabled()) {
+  if (vulkan_texture_cache.command_processor_.recording_checkpoints()) {
     std::string views;
     for (const auto& view_pair : views_) {
       views += fmt::format(" {:X}", uint64_t(view_pair.second));

@@ -267,6 +267,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Without a value, the current draw index in the frame.
   void Checkpoint(CheckpointKind kind, uint32_t value = UINT32_MAX, std::string detail = {});
   bool checkpoints_enabled() const { return checkpoints_enabled_; }
+  // True when either diagnostic trail is recording: the NV checkpoints or the
+  // universal breadcrumbs (Turnip). Call sites that build rich per-draw
+  // detail strings gate on this, not on checkpoints_enabled() alone, so the
+  // breadcrumb ring keeps the shader/pipeline/render-target identity.
+  bool recording_checkpoints() const { return checkpoints_enabled_ || breadcrumbs_enabled_; }
   // A CPU-side record in the checkpoint ring (resource lifetimes, bindings).
   void NoteCheckpoint(std::string detail);
   // vulkan_debug_labels: names GPU work for capture tools (Nsight Graphics
@@ -438,16 +443,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   static void BreadcrumbLossDump();
   bool checkpoints_enabled_ = false;
   // What each recent checkpoint serial was, for the device-loss report.
+  // detail is a fixed buffer, not a std::string: the recording thread writes
+  // one record per draw while a device-loss dump on another thread (the
+  // presenter's loss callback) reads the ring - a torn POD read yields
+  // garbage text, a torn std::string read yields a crash inside the dump.
+  // The serial is atomic so the dump's loop bounds are always valid values.
   struct CheckpointRecord {
+    static constexpr size_t kDetailBytes = 128;
     uint64_t serial = 0;
     CheckpointKind kind = CheckpointKind::kDraw;
     uint32_t frame = 0;
     uint32_t value = 0;
-    std::string detail;
+    char detail[kDetailBytes] = {};
   };
   static constexpr size_t kCheckpointRecords = size_t(1) << 16;
   std::vector<CheckpointRecord> checkpoint_records_;
-  uint64_t checkpoint_serial_ = 0;
+  std::atomic<uint64_t> checkpoint_serial_{0};
   // Universal breadcrumbs (no VK_NV_device_diagnostic_checkpoints needed,
   // works on Turnip/Mesa): the GPU fills 4-byte slots of a host-visible
   // buffer with checkpoint serials as it executes the tape outside render

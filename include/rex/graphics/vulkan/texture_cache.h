@@ -75,6 +75,20 @@ class VulkanTextureCache final : public TextureCache {
 
   ~VulkanTextureCache();
 
+  // Per-frame texture creation counters for the vulkan_frame_stats summary.
+  // Both are touched and read on the command processor thread only; Take
+  // resets them, so the frame's closing line reports exactly that frame.
+  uint64_t TakeFrameTextureCreations() {
+    const uint64_t created = frame_texture_creations_;
+    frame_texture_creations_ = 0;
+    return created;
+  }
+  uint64_t TakeFrameTextureCreateFailures() {
+    const uint64_t failed = frame_texture_create_failures_;
+    frame_texture_create_failures_ = 0;
+    return failed;
+  }
+
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
@@ -404,6 +418,10 @@ class VulkanTextureCache final : public TextureCache {
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
+
+  // Per-frame counters behind TakeFrameTextureCreations/Failures.
+  uint64_t frame_texture_creations_ = 0;
+  uint64_t frame_texture_create_failures_ = 0;
 
   // Using the Vulkan Memory Allocator because texture count in games is
   // naturally pretty much unbounded, while Vulkan implementations, especially
