@@ -4422,11 +4422,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       return draw_fail("begin_submission");
     }
     if (checkpoints_enabled_ || breadcrumbs_enabled_) {
-      // Early per-draw marker with the binary shader identity (no formatting
-      // on this hot path - up to three records per draw); the render target
-      // and pipeline identity follow after target binding as NoteDrawBind.
+      // Early per-draw marker with the binary draw identity (no formatting on
+      // this hot path - up to three records per draw); the render target and
+      // pipeline identity follow after target binding as NoteDrawBind.
       CheckpointDraw(vertex_shader->ucode_data_hash(),
-                     pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+                     pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                     uint32_t(prim_type), index_count);
     }
 
     // Process primitives.
@@ -6535,13 +6536,24 @@ void VulkanCommandProcessor::Checkpoint(CheckpointKind kind, uint32_t value,
   }
   const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
   CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
-  record.serial = serial;
+  // The binary identity fields are cleared on EVERY writer: a recycled slot
+  // must not carry the previous occupant's shaders into this record.
   record.kind = kind;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = value;
+  record.vertex_shader_hash = 0;
+  record.pixel_shader_hash = 0;
+  record.render_pass_key = 0;
+  record.pipeline_handle = 0;
+  record.primitive_type = 0;
+  record.index_count = 0;
   const size_t detail_bytes = std::min(detail.size(), CheckpointRecord::kDetailBytes - 1);
   std::memcpy(record.detail, detail.data(), detail_bytes);
   record.detail[detail_bytes] = '\0';
+  // The serial lands last: a concurrent loss-time dump that copies the slot
+  // mid-write still sees the previous serial and drops the record instead of
+  // mixing old identity with new content.
+  record.serial = serial;
   if (checkpoints_enabled_) {
     deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
   } else if (breadcrumb_buffer_ != VK_NULL_HANDLE &&
@@ -6565,7 +6577,6 @@ void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
   }
   const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
   CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
-  record.serial = serial;
   record.kind = CheckpointKind::kNote;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = debug_frame_draw_index_ - 1;
@@ -6573,19 +6584,23 @@ void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
   record.pixel_shader_hash = 0;
   record.render_pass_key = 0;
   record.pipeline_handle = 0;
+  record.primitive_type = 0;
+  record.index_count = 0;
   const size_t detail_bytes = std::min(detail.size(), CheckpointRecord::kDetailBytes - 1);
   std::memcpy(record.detail, detail.data(), detail_bytes);
   record.detail[detail_bytes] = '\0';
+  record.serial = serial;
 }
 
 void VulkanCommandProcessor::CheckpointDraw(uint64_t vertex_shader_hash,
-                                            uint64_t pixel_shader_hash) {
+                                            uint64_t pixel_shader_hash,
+                                            uint32_t primitive_type,
+                                            uint32_t index_count) {
   if (!checkpoints_enabled_ && !breadcrumbs_enabled_) {
     return;
   }
   const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
   CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
-  record.serial = serial;
   record.kind = CheckpointKind::kDraw;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = debug_frame_draw_index_ - 1;
@@ -6593,7 +6608,10 @@ void VulkanCommandProcessor::CheckpointDraw(uint64_t vertex_shader_hash,
   record.pixel_shader_hash = pixel_shader_hash;
   record.render_pass_key = 0;
   record.pipeline_handle = 0;
+  record.primitive_type = primitive_type;
+  record.index_count = index_count;
   record.detail[0] = '\0';
+  record.serial = serial;
   if (checkpoints_enabled_) {
     deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
   } else if (breadcrumb_buffer_ != VK_NULL_HANDLE &&
@@ -6611,7 +6629,6 @@ void VulkanCommandProcessor::NoteDrawBind(uint64_t render_pass_key,
   }
   const uint64_t serial = checkpoint_serial_.fetch_add(1, std::memory_order_relaxed) + 1;
   CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
-  record.serial = serial;
   record.kind = CheckpointKind::kNote;
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = debug_frame_draw_index_ - 1;
@@ -6619,7 +6636,10 @@ void VulkanCommandProcessor::NoteDrawBind(uint64_t render_pass_key,
   record.pixel_shader_hash = 0;
   record.render_pass_key = render_pass_key;
   record.pipeline_handle = pipeline_handle;
+  record.primitive_type = 0;
+  record.index_count = 0;
   record.detail[0] = '\0';
+  record.serial = serial;
 }
 
 void VulkanCommandProcessor::LogCheckpoints() {
@@ -6650,18 +6670,26 @@ void VulkanCommandProcessor::LogCheckpoints() {
         return fmt::format("#{} (no longer recorded)", serial);
       }
       const uint32_t kind = uint32_t(snapshot.kind);
-      std::string identity;
+      std::string suffix;
       if (snapshot.vertex_shader_hash || snapshot.pixel_shader_hash) {
-        identity += fmt::format(" vs {:016X} ps {:016X}", snapshot.vertex_shader_hash,
-                                snapshot.pixel_shader_hash);
+        suffix += fmt::format(" vs {:016X} ps {:016X}", snapshot.vertex_shader_hash,
+                              snapshot.pixel_shader_hash);
       }
       if (snapshot.render_pass_key || snapshot.pipeline_handle) {
-        identity += fmt::format(" pass {:016X} pipe {:016X}", snapshot.render_pass_key,
-                                snapshot.pipeline_handle);
+        suffix += fmt::format(" pass {:016X} pipe {:016X}", snapshot.render_pass_key,
+                              snapshot.pipeline_handle);
       }
-      return fmt::format("#{} {} {} (frame {}){}{}", serial,
+      if (snapshot.index_count) {
+        suffix += fmt::format(" prim {} indices {}", snapshot.primitive_type,
+                              snapshot.index_count);
+      }
+      if (snapshot.detail[0]) {
+        suffix += ' ';
+        suffix += snapshot.detail;
+      }
+      return fmt::format("#{} {} {} (frame {}){}", serial,
                          kind < std::size(kKinds) ? kKinds[kind] : "?", snapshot.value,
-                         snapshot.frame, identity, snapshot.detail);
+                         snapshot.frame, suffix);
     };
     uint32_t gpu_reached = 0;
     if (breadcrumb_mapped_) {
@@ -6687,11 +6715,22 @@ void VulkanCommandProcessor::LogCheckpoints() {
     for (uint64_t serial = first; serial <= gpu_reached; ++serial) {
       REXGPU_ERROR("breadcrumb done: {}", describe(serial));
     }
-    // Pending records (never confirmed by the GPU): the suspects. At most the
-    // last 64, the closest to the recording head.
-    const uint64_t first_pending =
-        std::max<uint64_t>(gpu_reached + 1, serial_now > 64 ? serial_now - 64 : 1);
-    for (uint64_t serial = first_pending; serial <= serial_now; ++serial) {
+    // Pending records (never confirmed by the GPU): the suspects. The first
+    // 64 right after the last confirmed marker are the primary suspects (the
+    // GPU stopped there); beyond that, only the last 64 before the recording
+    // head, with the omitted span counted between them.
+    const uint64_t first_pending = gpu_reached + 1;
+    const uint64_t after_marker_end = std::min<uint64_t>(serial_now, gpu_reached + 64);
+    for (uint64_t serial = first_pending; serial <= after_marker_end; ++serial) {
+      REXGPU_ERROR("breadcrumb pending (suspect): {}", describe(serial));
+    }
+    const uint64_t tail_start = std::max(after_marker_end + 1,
+                                         serial_now > 64 ? serial_now - 64 : 1);
+    if (tail_start > after_marker_end + 1) {
+      REXGPU_ERROR("breadcrumb pending: ... {} records omitted ...",
+                   tail_start - after_marker_end - 1);
+    }
+    for (uint64_t serial = tail_start; serial <= serial_now; ++serial) {
       REXGPU_ERROR("breadcrumb pending (suspect): {}", describe(serial));
     }
     const uint64_t first_recorded =
@@ -6728,18 +6767,26 @@ void VulkanCommandProcessor::LogCheckpoints() {
       return fmt::format("#{} (no longer recorded)", serial);
     }
     const uint32_t kind = uint32_t(snapshot.kind);
-    std::string identity;
+    std::string suffix;
     if (snapshot.vertex_shader_hash || snapshot.pixel_shader_hash) {
-      identity += fmt::format(" vs {:016X} ps {:016X}", snapshot.vertex_shader_hash,
-                              snapshot.pixel_shader_hash);
+      suffix += fmt::format(" vs {:016X} ps {:016X}", snapshot.vertex_shader_hash,
+                            snapshot.pixel_shader_hash);
     }
     if (snapshot.render_pass_key || snapshot.pipeline_handle) {
-      identity += fmt::format(" pass {:016X} pipe {:016X}", snapshot.render_pass_key,
-                              snapshot.pipeline_handle);
+      suffix += fmt::format(" pass {:016X} pipe {:016X}", snapshot.render_pass_key,
+                            snapshot.pipeline_handle);
     }
-    return fmt::format("#{} {} {} (frame {}){}{}", serial,
+    if (snapshot.index_count) {
+      suffix += fmt::format(" prim {} indices {}", snapshot.primitive_type,
+                            snapshot.index_count);
+    }
+    if (snapshot.detail[0]) {
+      suffix += ' ';
+      suffix += snapshot.detail;
+    }
+    return fmt::format("#{} {} {} (frame {}){}", serial,
                        kind < std::size(kKinds) ? kKinds[kind] : "?", snapshot.value,
-                       snapshot.frame, identity, snapshot.detail);
+                       snapshot.frame, suffix);
   };
   uint64_t finished = 0, begun = 0;
   const uint64_t serial_now = checkpoint_serial_.load(std::memory_order_relaxed);

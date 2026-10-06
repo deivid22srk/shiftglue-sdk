@@ -268,8 +268,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Without a value, the current draw index in the frame.
   void Checkpoint(CheckpointKind kind, uint32_t value = UINT32_MAX, std::string detail = {});
   // The per-draw hot path: records the draw with its binary identity (shader
-  // ucode hashes) and NO string formatting on the recording thread.
-  void CheckpointDraw(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash);
+  // ucode hashes, primitive type and index count) and NO string formatting on
+  // the recording thread.
+  void CheckpointDraw(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash,
+                      uint32_t primitive_type, uint32_t index_count);
   // Records the resolved pipeline identity right before the pipeline bind,
   // also without formatting on the recording thread.
   void NoteDrawBind(uint64_t render_pass_key, uint64_t pipeline_handle);
@@ -469,6 +471,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t pixel_shader_hash = 0;
     uint64_t render_pass_key = 0;
     uint64_t pipeline_handle = 0;
+    // Draw geometry (CheckpointDraw); index_count 0 when absent.
+    uint32_t primitive_type = 0;
+    uint32_t index_count = 0;
     char detail[kDetailBytes] = {};
   };
   static_assert(std::is_trivially_copyable_v<CheckpointRecord>);
