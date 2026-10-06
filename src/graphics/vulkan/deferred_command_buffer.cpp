@@ -30,6 +30,7 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
+  recording_render_pass_depth_ = 0;
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
@@ -322,6 +323,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                  reinterpret_cast<const void*>(uintptr_t(args.marker)));
       } break;
 
+      case Command::kVkFillBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
+        dfn.vkCmdFillBuffer(command_buffer, args.buffer, args.offset, args.size, args.data);
+      } break;
+
       case Command::kVkWriteTimestamp: {
         auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
         dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool,
@@ -454,6 +460,7 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
   args.color_attachment_count = rendering_info->colorAttachmentCount;
   args.has_depth_attachment = rendering_info->pDepthAttachment != nullptr;
   args.has_stencil_attachment = rendering_info->pStencilAttachment != nullptr;
+  ++recording_render_pass_depth_;
 
   if (rendering_info->colorAttachmentCount) {
     std::memcpy(args_ptr + color_attachments_offset, rendering_info->pColorAttachments,

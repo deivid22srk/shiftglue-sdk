@@ -31,8 +31,12 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
   // Exchanges the recorded commands (the submission worker takes a finished
-  // stream and leaves an empty one to record into).
-  void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
+  // stream and leaves an empty one to record into). The render pass depth
+  // belongs to the stream it was recorded against.
+  void Swap(DeferredCommandBuffer& other) {
+    command_stream_.swap(other.command_stream_);
+    std::swap(recording_render_pass_depth_, other.recording_render_pass_depth_);
+  }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -58,6 +62,7 @@ class DeferredCommandBuffer {
       std::memcpy(args_ptr + clear_values_offset, render_pass_begin->pClearValues,
                   sizeof(VkClearValue) * clear_value_count);
     }
+    ++recording_render_pass_depth_;
   }
 
   void CmdVkBindDescriptorSets(VkPipelineBindPoint pipeline_bind_point, VkPipelineLayout layout,
@@ -262,11 +267,38 @@ class DeferredCommandBuffer {
     args.query = query;
   }
 
-  void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
+  void CmdVkEndRenderPass() {
+    WriteCommand(Command::kVkEndRenderPass, 0);
+    // Recording-side render pass depth, so transfer commands (such as the
+    // breadcrumb marker fills) are never appended inside an open pass -
+    // vkCmdFillBuffer is illegal there.
+    --recording_render_pass_depth_;
+  }
 
   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
-  void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+  void CmdVkEndRendering() {
+    WriteCommand(Command::kVkEndRendering, 0);
+    --recording_render_pass_depth_;
+  }
+
+  // True while the commands recorded so far sit inside an unclosed render
+  // pass (or dynamic rendering instance). Transfer-only commands must not be
+  // appended in that state.
+  bool IsRecordingInsideRenderPass() const { return recording_render_pass_depth_ != 0; }
+
+  // A GPU breadcrumb marker: fills one 4-byte slot of the host-visible
+  // breadcrumb buffer with the checkpoint serial once the GPU executes it.
+  // Only legal outside a render pass - Checkpoint() guards with
+  // IsRecordingInsideRenderPass().
+  void CmdVkFillBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.buffer = buffer;
+    args.offset = offset;
+    args.size = size;
+    args.data = data;
+  }
 
   // Debug utils labels for capture tools; `name` must outlive the stream
   // (a string literal).
@@ -425,6 +457,7 @@ class DeferredCommandBuffer {
     kVkResetQueryPool,
     kVkWriteTimestamp,
     kVkSetCheckpointNV,
+    kVkFillBuffer,
     kVkBeginDebugLabel,
     kVkEndDebugLabel,
     kVkSetBlendConstants,
@@ -583,6 +616,13 @@ class DeferredCommandBuffer {
     uint64_t marker;
   };
 
+  struct ArgsVkFillBuffer {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t data;
+  };
+
   struct ArgsVkBeginDebugLabel {
     const char* name;
   };
@@ -659,6 +699,10 @@ class DeferredCommandBuffer {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+
+  // Number of render passes (or dynamic rendering instances) opened but not
+  // yet closed in the commands recorded so far. See CmdVkEndRenderPass.
+  uint32_t recording_render_pass_depth_ = 0;
 };
 
 }  // namespace rex::graphics::vulkan

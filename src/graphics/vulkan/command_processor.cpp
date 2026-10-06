@@ -122,6 +122,12 @@ REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, REX_PLATFORM_ANDROID ? 30
                      "the resident size, with their peaks, this often (0: never)")
     .range(0, 3600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_breadcrumbs, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Record per-draw breadcrumb metadata and GPU-execution markers "
+                    "(vkCmdFillBuffer into a host-visible buffer) so a device loss reports "
+                    "the last work the GPU confirmed and the pending suspects; used when "
+                    "VK_NV_device_diagnostic_checkpoints is unavailable (Turnip/Mesa)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -130,6 +136,10 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 namespace rex::graphics::vulkan {
 
 namespace {
+
+// The command processor currently owning the breadcrumb resources, for the
+// process-wide device-loss dump callback registered with the graphics system.
+std::atomic<VulkanCommandProcessor*> g_breadcrumbs_command_processor{nullptr};
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -668,7 +678,16 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
   legacy_readback_memexport_cvar_name_ = "vulkan_readback_memexport";
 }
 
-VulkanCommandProcessor::~VulkanCommandProcessor() = default;
+VulkanCommandProcessor::~VulkanCommandProcessor() {
+  if (g_breadcrumbs_command_processor.load(std::memory_order_acquire) == this) {
+    g_breadcrumbs_command_processor.store(nullptr, std::memory_order_release);
+    if (rex::graphics::GetGpuLossDiagnosticsCallback() ==
+        &VulkanCommandProcessor::BreadcrumbLossDump) {
+      rex::graphics::SetGpuLossDiagnosticsCallback(nullptr);
+    }
+  }
+  TeardownBreadcrumbs();
+}
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
@@ -6450,7 +6469,7 @@ bool VulkanCommandProcessor::ExecuteSubmission(
 
 void VulkanCommandProcessor::Checkpoint(CheckpointKind kind, uint32_t value,
                                         std::string detail) {
-  if (!checkpoints_enabled_) {
+  if (!checkpoints_enabled_ && !breadcrumbs_enabled_) {
     return;
   }
   if (value == UINT32_MAX) {
@@ -6463,11 +6482,25 @@ void VulkanCommandProcessor::Checkpoint(CheckpointKind kind, uint32_t value,
   record.frame = uint32_t(observation_frame_sequence_);
   record.value = value;
   record.detail = std::move(detail);
-  deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
+  if (checkpoints_enabled_) {
+    deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
+  } else if (breadcrumb_buffer_ != VK_NULL_HANDLE &&
+             !deferred_command_buffer_.IsRecordingInsideRenderPass()) {
+    // A GPU-side execution marker for drivers without
+    // VK_NV_device_diagnostic_checkpoints: when the GPU executes this fill,
+    // the serial becomes visible in the mapped buffer. vkCmdFillBuffer is a
+    // transfer command and illegal inside a render pass, so draws inside a
+    // pass get the ring record only - inter-pass work (loads, copies,
+    // resolves, clears, submission ends) gets the marker, and the ring
+    // details everything between two markers.
+    deferred_command_buffer_.CmdVkFillBuffer(
+        breadcrumb_buffer_, VkDeviceSize((serial % kBreadcrumbSlots) * 4), 4,
+        uint32_t(serial));
+  }
 }
 
 void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
-  if (!checkpoints_enabled_) {
+  if (!checkpoints_enabled_ && !breadcrumbs_enabled_) {
     return;
   }
   const uint64_t serial = ++checkpoint_serial_;
@@ -6482,7 +6515,70 @@ void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
 void VulkanCommandProcessor::LogCheckpoints() {
   // Once: every later wait or submission reports the same loss.
   static std::atomic<bool> logged{false};
-  if (!checkpoints_enabled_ || logged.exchange(true)) {
+  if ((!checkpoints_enabled_ && !breadcrumbs_enabled_) || logged.exchange(true)) {
+    return;
+  }
+  if (!checkpoints_enabled_) {
+    // No NV checkpoints (Turnip/Mesa): dump from the breadcrumb trail
+    // instead. The largest serial present in the mapped marker buffer is the
+    // last work the GPU confirmed executing; the ring records after it were
+    // in flight or never reached - the suspects.
+    static const char* const kKinds[] = {"?",           "draw",        "copy",
+                                         "texture load", "resolve",     "transfer",
+                                         "clear",        "draw end",    "texture load end",
+                                         "note"};
+    auto describe = [&](uint64_t serial) {
+      const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+      if (record.serial != serial) {
+        return fmt::format("#{} (no longer recorded)", serial);
+      }
+      const uint32_t kind = uint32_t(record.kind);
+      return fmt::format("#{} {} {} (frame {}) {}", serial,
+                         kind < std::size(kKinds) ? kKinds[kind] : "?", record.value,
+                         record.frame, record.detail);
+    };
+    uint32_t gpu_reached = 0;
+    if (breadcrumb_mapped_) {
+      if (!breadcrumb_memory_coherent_ && breadcrumb_memory_ != VK_NULL_HANDLE) {
+        // Best effort: after VK_ERROR_DEVICE_LOST this may itself fail; the
+        // mapping stays readable regardless.
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = breadcrumb_memory_;
+        range.offset = 0;
+        range.size = VkDeviceSize(kBreadcrumbSlots) * 4;
+        GetVulkanDevice()->functions().vkInvalidateMappedMemoryRanges(
+            GetVulkanDevice()->device(), 1, &range);
+      }
+      for (uint32_t slot = 0; slot < kBreadcrumbSlots; ++slot) {
+        gpu_reached = std::max(gpu_reached, breadcrumb_mapped_[slot]);
+      }
+    }
+    REXGPU_ERROR(
+        "Vulkan device lost (breadcrumbs); GPU confirmed marker #{}, last recorded #{}:",
+        gpu_reached, checkpoint_serial_);
+    const uint64_t first = gpu_reached > 48 ? gpu_reached - 48 : 1;
+    for (uint64_t serial = first; serial <= gpu_reached; ++serial) {
+      REXGPU_ERROR("  done: {}", describe(serial));
+    }
+    // Pending records (never confirmed by the GPU): the suspects. At most the
+    // last 64, the closest to the recording head.
+    const uint64_t first_pending =
+        std::max<uint64_t>(gpu_reached + 1,
+                           checkpoint_serial_ > 64 ? checkpoint_serial_ - 64 : 1);
+    for (uint64_t serial = first_pending; serial <= checkpoint_serial_; ++serial) {
+      REXGPU_ERROR("  pending (suspect): {}", describe(serial));
+    }
+    const uint64_t first_recorded =
+        checkpoint_serial_ >= kCheckpointRecords
+            ? checkpoint_serial_ - kCheckpointRecords + 1
+            : 1;
+    for (uint64_t serial = first_recorded; serial <= checkpoint_serial_; ++serial) {
+      const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+      if (record.serial == serial && record.kind == CheckpointKind::kNote &&
+          record.detail.rfind("destroy", 0) == 0) {
+        REXGPU_ERROR("  destroyed: {}", describe(serial));
+      }
+    }
     return;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -6544,11 +6640,131 @@ void VulkanCommandProcessor::LogCheckpoints() {
   }
 }
 
+bool VulkanCommandProcessor::SetupBreadcrumbs() {
+  if (checkpoints_enabled_) {
+    // The NV checkpoints give strictly better information (per-draw GPU
+    // markers legal inside render passes); breadcrumbs add nothing.
+    return false;
+  }
+  if (!REXCVAR_GET(vulkan_breadcrumbs)) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkBufferCreateInfo buffer_create_info;
+  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_create_info.pNext = nullptr;
+  buffer_create_info.flags = 0;
+  buffer_create_info.size = VkDeviceSize(kBreadcrumbSlots) * 4;
+  buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  buffer_create_info.queueFamilyIndexCount = 0;
+  buffer_create_info.pQueueFamilyIndices = nullptr;
+  VkBuffer buffer;
+  if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer) != VK_SUCCESS) {
+    REXGPU_WARN("VulkanCommandProcessor: could not create the breadcrumb marker buffer; "
+                "device-loss reports will lack GPU-side confirmation");
+    return false;
+  }
+  VkMemoryRequirements memory_requirements;
+  dfn.vkGetBufferMemoryRequirements(device, buffer, &memory_requirements);
+  // Prefer a host-cached type: the buffer is written by the GPU and read by
+  // the CPU at loss time (readback semantics).
+  const uint32_t memory_type =
+      ui::vulkan::util::ChooseHostMemoryType(vulkan_device->memory_types(),
+                                              memory_requirements.memoryTypeBits, true);
+  if (memory_type == UINT32_MAX) {
+    REXGPU_WARN("VulkanCommandProcessor: no host-visible memory type for the breadcrumb "
+                "marker buffer; device-loss reports will lack GPU-side confirmation");
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    return false;
+  }
+  VkMemoryAllocateInfo memory_allocate_info;
+  memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  memory_allocate_info.pNext = nullptr;
+  memory_allocate_info.allocationSize = memory_requirements.size;
+  memory_allocate_info.memoryTypeIndex = memory_type;
+  VkDeviceMemory memory;
+  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS ||
+      dfn.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+    REXGPU_WARN("VulkanCommandProcessor: could not allocate/bind the breadcrumb marker "
+                "memory; device-loss reports will lack GPU-side confirmation");
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    if (memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, memory, nullptr);
+    }
+    return false;
+  }
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
+    REXGPU_WARN("VulkanCommandProcessor: could not map the breadcrumb marker memory; "
+                "device-loss reports will lack GPU-side confirmation");
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    dfn.vkFreeMemory(device, memory, nullptr);
+    return false;
+  }
+  std::memset(mapping, 0, size_t(buffer_create_info.size));
+  breadcrumb_buffer_ = buffer;
+  breadcrumb_memory_ = memory;
+  breadcrumb_memory_type_ = memory_type;
+  breadcrumb_mapped_ = static_cast<uint32_t*>(mapping);
+  breadcrumb_device_ = vulkan_device;
+  breadcrumb_memory_coherent_ =
+      (vulkan_device->memory_types().host_coherent & (UINT32_C(1) << memory_type)) != 0;
+  if (!breadcrumb_memory_coherent_) {
+    // Make the zeroing visible to the GPU's future fills.
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, memory, memory_type, 0,
+                                             memory_requirements.size,
+                                             memory_requirements.size);
+  }
+  REXGPU_INFO("Vulkan GPU breadcrumbs enabled ({} x 4-byte vkCmdFillBuffer markers, "
+              "memory type {}, coherent {})",
+              kBreadcrumbSlots, memory_type, breadcrumb_memory_coherent_);
+  return true;
+}
+
+void VulkanCommandProcessor::TeardownBreadcrumbs() {
+  if (breadcrumb_buffer_ == VK_NULL_HANDLE && breadcrumb_memory_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = breadcrumb_device_;
+  if (vulkan_device == nullptr) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // Unmapping is implicit when the memory is freed.
+  dfn.vkDestroyBuffer(device, breadcrumb_buffer_, nullptr);
+  dfn.vkFreeMemory(device, breadcrumb_memory_, nullptr);
+  breadcrumb_buffer_ = VK_NULL_HANDLE;
+  breadcrumb_memory_ = VK_NULL_HANDLE;
+  breadcrumb_mapped_ = nullptr;
+}
+
+void VulkanCommandProcessor::BreadcrumbLossDump() {
+  VulkanCommandProcessor* const command_processor =
+      g_breadcrumbs_command_processor.load(std::memory_order_acquire);
+  if (command_processor != nullptr) {
+    command_processor->LogCheckpoints();
+  }
+}
+
 void VulkanCommandProcessor::StartSubmissionWorker() {
   checkpoints_enabled_ = GetVulkanDevice()->extensions().ext_NV_device_diagnostic_checkpoints;
   if (checkpoints_enabled_) {
     checkpoint_records_.resize(kCheckpointRecords);
     REXGPU_INFO("Vulkan diagnostic checkpoints enabled");
+  }
+  breadcrumbs_enabled_ = SetupBreadcrumbs();
+  if (breadcrumbs_enabled_) {
+    checkpoint_records_.resize(kCheckpointRecords);
+    // Presenters and fences report device losses through paths that do not
+    // run through this processor's own LogCheckpoints call sites; the
+    // graphics system invokes this thunk once before the fatal error.
+    g_breadcrumbs_command_processor.store(this, std::memory_order_release);
+    rex::graphics::SetGpuLossDiagnosticsCallback(&VulkanCommandProcessor::BreadcrumbLossDump);
   }
   async_submission_ = REXCVAR_GET(vulkan_async_submission);
   submission_split_draws_ = uint32_t(std::max(0, REXCVAR_GET(vulkan_async_submission_split_draws)));

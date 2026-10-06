@@ -46,6 +46,19 @@ namespace rex::graphics {
 
 class CommandProcessor;
 
+// Dumped once, from any device-loss path, right before the fatal error ends
+// the process: a backend registers its last-known GPU state dumper (the Vulkan
+// command processor dumps its breadcrumb/checkpoint trail) so a device loss
+// on a driver without VK_NV_device_diagnostic_checkpoints (Turnip/Mesa) is
+// still diagnosable from the log. Runs on a normal error path - not from a
+// signal handler - so logging and allocation are allowed. Registered once at
+// command processor setup; the process aborts immediately after, so the
+// callback outlives its registration in practice, but unregistering in the
+// destructor is still required for clean shutdown paths.
+using GpuLossDiagnosticsCallback = void (*)();
+void SetGpuLossDiagnosticsCallback(GpuLossDiagnosticsCallback callback);
+GpuLossDiagnosticsCallback GetGpuLossDiagnosticsCallback();
+
 class GraphicsSystem : public system::IGraphicsSystem {
  public:
   virtual ~GraphicsSystem();

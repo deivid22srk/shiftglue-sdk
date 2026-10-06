@@ -427,6 +427,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   void SubmissionWorkerMain();
   void AwaitSubmissionWorker();
   void LogCheckpoints();
+  // Creates the universal breadcrumb resources (host-visible marker buffer
+  // written by vkCmdFillBuffer) when VK_NV_device_diagnostic_checkpoints is
+  // unavailable and vulkan_breadcrumbs is on. Fails soft: without the buffer
+  // the ring records still work, only without GPU-side confirmation.
+  bool SetupBreadcrumbs();
+  void TeardownBreadcrumbs();
+  // Entry for the process-wide device-loss diagnostics callback: dumps the
+  // breadcrumb trail from whichever command processor owns it.
+  static void BreadcrumbLossDump();
   bool checkpoints_enabled_ = false;
   // What each recent checkpoint serial was, for the device-loss report.
   struct CheckpointRecord {
@@ -439,6 +448,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   static constexpr size_t kCheckpointRecords = size_t(1) << 16;
   std::vector<CheckpointRecord> checkpoint_records_;
   uint64_t checkpoint_serial_ = 0;
+  // Universal breadcrumbs (no VK_NV_device_diagnostic_checkpoints needed,
+  // works on Turnip/Mesa): the GPU fills 4-byte slots of a host-visible
+  // buffer with checkpoint serials as it executes the tape outside render
+  // passes; the ring above keeps the per-draw metadata. On device loss the
+  // largest filled serial is the last work the GPU confirmed, and the ring
+  // records after it are the suspects.
+  bool breadcrumbs_enabled_ = false;
+  static constexpr uint32_t kBreadcrumbSlots = 4096;
+  VkBuffer breadcrumb_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory breadcrumb_memory_ = VK_NULL_HANDLE;
+  uint32_t breadcrumb_memory_type_ = 0;
+  bool breadcrumb_memory_coherent_ = false;
+  uint32_t* breadcrumb_mapped_ = nullptr;
+  // Captured at setup so TeardownBreadcrumbs never has to ask the graphics
+  // system for anything while the processor is being destroyed.
+  const ui::vulkan::VulkanDevice* breadcrumb_device_ = nullptr;
   bool async_submission_ = false;
   uint32_t submission_split_draws_ = 0;
   uint32_t submission_draws_ = 0;

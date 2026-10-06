@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -35,6 +36,17 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+namespace {
+
+// The process-wide device-loss diagnostics dumper (see graphics_system.h).
+std::atomic<rex::graphics::GpuLossDiagnosticsCallback>&
+GetGpuLossDiagnosticsCallbackStorage() {
+  static std::atomic<rex::graphics::GpuLossDiagnosticsCallback> callback{nullptr};
+  return callback;
+}
+
+}  // namespace
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
@@ -312,6 +324,14 @@ void GraphicsSystem::Shutdown() {
   provider_.reset();
 }
 
+void SetGpuLossDiagnosticsCallback(GpuLossDiagnosticsCallback callback) {
+  GetGpuLossDiagnosticsCallbackStorage().store(callback, std::memory_order_release);
+}
+
+GpuLossDiagnosticsCallback GetGpuLossDiagnosticsCallback() {
+  return GetGpuLossDiagnosticsCallbackStorage().load(std::memory_order_acquire);
+}
+
 void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
   // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
   // used by the command processor, the presenter, and possibly anything else,
@@ -325,6 +345,13 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   // reset).
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
+  }
+  // Give the backend one chance to dump its last-known GPU state (Vulkan
+  // breadcrumbs) before the fatal error ends the process. Presenters and
+  // fences report losses through paths that do not run through the command
+  // processor's own dump sites.
+  if (GpuLossDiagnosticsCallback callback = GetGpuLossDiagnosticsCallback()) {
+    callback();
   }
   rex::FatalError("Graphics device lost (probably due to an internal error)");
 }
