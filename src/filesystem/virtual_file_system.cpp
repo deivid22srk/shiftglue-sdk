@@ -232,6 +232,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
       *out_action = FileAction::kDoesNotExist;
+      // The full failure context for the files log: the guest path and the
+      // base (device + directory prefix) that failed to resolve, next to
+      // ResolvePath's own device-resolution error - so a missing disc
+      // folder (MTP-dropped directories, absent banks such as
+      // AMB_Redstone.fsb) is distinguishable from a path-prefix problem.
+      REXFS_WARN("vfs open failed: '{}' base '{}' not resolvable status NO_SUCH_FILE", path,
+                 base_path);
       return X_STATUS_NO_SUCH_FILE;
     }
 
@@ -275,6 +282,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       // Must exist.
       if (!entry) {
         *out_action = FileAction::kDoesNotExist;
+        const auto* host_parent = dynamic_cast<const HostPathEntry*>(parent_entry);
+        REXFS_WARN("vfs open failed: '{}' not found under '{}' (host '{}') status NO_SUCH_FILE",
+                   path, base_path.empty() ? std::string("(root)") : std::string(base_path),
+                   host_parent ? host_parent->host_path().string() : std::string("?"));
         return X_STATUS_NO_SUCH_FILE;
       }
       break;

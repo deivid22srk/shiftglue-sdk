@@ -62,6 +62,11 @@ REXCVAR_DEFINE_BOOL(fh1_fmv_retain, true, "GPU/Vulkan",
                     "CPU fast path snapshots a torn mid-rewrite plane (the decoder rewrites "
                     "it top to bottom); false restores always uploading every snapshot")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_texture_log, false, "GPU/Vulkan",
+                    "Log one line per created texture: guest address, Xenos format, the host "
+                    "format chosen for this device (and whether it is a fallback), tiling, "
+                    "endianness, dimensions, mip count and guest byte sizes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -1306,6 +1311,23 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
 
   auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
   texture->set_copy_words(copy_words);
+  if (REXCVAR_GET(vulkan_texture_log)) {
+    // One line per created texture, with everything needed to correlate a
+    // broken surface on device with the guest resource behind it: guest
+    // address, Xenos format, chosen host format and whether it is a fallback
+    // for this device, tiling/endian, dimensions, mips and the guest-side
+    // byte sizes. Video-relevant formats (YUV 4:2:2 packed, DXN, CTX1) are
+    // visible directly from the format numbers.
+    const bool host_format_is_fallback =
+        formats[0] != kBestHostFormats[uint32_t(key.format)].format_unsigned.format;
+    REXGPU_INFO("texture created: {:08X} xenos {} -> vk {}{} {}x{}x{} mips {} tiled {} endian {} "
+                "guest {}+{} bytes",
+                key.base_page << 12, uint32_t(key.format), uint32_t(formats[0]),
+                host_format_is_fallback ? " (fallback)" : "", key.GetWidth(), key.GetHeight(),
+                key.GetDepthOrArraySize(), unsigned(key.mip_max_level) + 1,
+                uint32_t(key.tiled), uint32_t(key.endianness),
+                texture->GetGuestBaseSize(), texture->GetGuestMipsSize());
+  }
   return texture;
 }
 
