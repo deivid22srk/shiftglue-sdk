@@ -2813,7 +2813,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
   if (swap_texture_view == VK_NULL_HANDLE) {
-    REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+    REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL (frame {})", frame_current_);
+    // Close the frame the same way the placeholder-skip path above does:
+    // returning with the frame still open leaves frame_open_ true and the
+    // stale frame_used_async_placeholder_pipeline_ unreset, so the next
+    // BeginSubmission(true) does not open a new frame and a stale flag can
+    // skip subsequent presents.
+    EndSubmission(true);
     return;
   }
   if (frontbuffer_format == xenos::TextureFormat::k_16_16_16_16) {
