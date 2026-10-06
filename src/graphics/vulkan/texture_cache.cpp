@@ -1549,10 +1549,15 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
       vulkan_texture.MarkAsUsed();
       static std::atomic<uint32_t> fmv_static_frames{0};
       const uint32_t fmv_static = fmv_static_frames.fetch_add(1, std::memory_order_relaxed);
-      if (fmv_static % 128 == 0) {
+      if (fmv_static % 8 == 0) {
         REXGPU_INFO("fh1 fmv snapshot identical to the uploaded frame, skipped: {:08X} "
-                    "{}x{} bytes {}",
-                    key.base_page << 12, key.GetWidth(), key.GetHeight(), size_bytes);
+                    "{}x{} bytes {} boundary {}/{} repeats {}",
+                    key.base_page << 12, key.GetWidth(), key.GetHeight(), size_bytes,
+                    vulkan_texture.video_frame_boundary_block() ==
+                            VulkanTexture::kNoVideoFrameBoundary
+                        ? 0u
+                        : vulkan_texture.video_frame_boundary_block(),
+                    fmv_block_count, vulkan_texture.video_frame_boundary_repeats());
       }
       return true;
     }
@@ -1572,6 +1577,77 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
       }
     }
     if (fmv_reaches_bottom) {
+      // A plane that changed through the last block is normally a fully
+      // rewritten frame - upload and make it the new baseline. One signature
+      // is different: the snapshot's bottom is all zero while the baseline's
+      // bottom holds content. That is the plane the decoder just CLEARED
+      // (scene cut, title loop restart): every block differs (new content
+      // above the rewrite cursor, zeros against old pixels below it), so the
+      // plain upload would push "new top + black bottom" snapshots one after
+      // another - the mid-video black flicker - until the baseline itself
+      // turns zero-tailed. Instead, retain the last complete frame while the
+      // snapshot's content edge (its lowest non-zero block) descends. A
+      // stationary edge for kFmvBoundaryRepeatUpload snapshots means either
+      // a frozen decoder or a legitimately black-bottomed frame (a hard cut
+      // to a letterboxed scene) - both escape to the upload so content keeps
+      // flowing, and the escaped upload re-baselines the plane.
+      unsigned fmv_content_edge = fmv_block_count;
+      for (unsigned fmv_block = fmv_block_count; fmv_block-- > 0;) {
+        const size_t fmv_offset = size_t(fmv_block) * fmv_block_bytes;
+        const size_t fmv_length = std::min(fmv_block_bytes, size_bytes - fmv_offset);
+        bool fmv_block_zero = true;
+        for (size_t fmv_byte = 0; fmv_byte < fmv_length; ++fmv_byte) {
+          if (staging_mapping[fmv_offset + fmv_byte]) {
+            fmv_block_zero = false;
+            break;
+          }
+        }
+        if (!fmv_block_zero) {
+          fmv_content_edge = fmv_block;
+          break;
+        }
+      }
+      bool fmv_baseline_bottom_nonzero = false;
+      {
+        const size_t fmv_offset = size_t(fmv_block_count - 1) * fmv_block_bytes;
+        const size_t fmv_length = std::min(fmv_block_bytes, size_bytes - fmv_offset);
+        for (size_t fmv_byte = 0; fmv_byte < fmv_length; ++fmv_byte) {
+          if (fmv_baseline[fmv_offset + fmv_byte]) {
+            fmv_baseline_bottom_nonzero = true;
+            break;
+          }
+        }
+      }
+      if (fmv_content_edge != fmv_block_count - 1 && fmv_baseline_bottom_nonzero) {
+        const bool fmv_edge_moved =
+            fmv_content_edge != vulkan_texture.video_frame_boundary_block();
+        vulkan_texture.note_video_frame_boundary(fmv_content_edge, fmv_edge_moved);
+        if (fmv_edge_moved ||
+            vulkan_texture.video_frame_boundary_repeats() < kFmvBoundaryRepeatUpload) {
+          vulkan_texture.MarkAsUsed();
+          static std::atomic<uint32_t> fmv_retained_cleared_frames{0};
+          const uint32_t fmv_retained_cleared =
+              fmv_retained_cleared_frames.fetch_add(1, std::memory_order_relaxed);
+          if (fmv_retained_cleared % 32 == 0) {
+            REXGPU_INFO("fh1 fmv cleared-plane snapshot retained last complete frame: {:08X} "
+                        "{}x{} edge {}/{} repeats {}",
+                        key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_content_edge,
+                        fmv_block_count, vulkan_texture.video_frame_boundary_repeats());
+          }
+          return true;
+        }
+        if (REXCVAR_GET(fh1_fmv_debug)) {
+          static std::atomic<uint32_t> fmv_cleared_escapes{0};
+          const uint32_t fmv_cleared_escape =
+              fmv_cleared_escapes.fetch_add(1, std::memory_order_relaxed);
+          if (fmv_cleared_escape % 8 == 0) {
+            REXGPU_INFO("fh1 fmv cleared-plane boundary-escape upload: {:08X} {}x{} edge {}/{} "
+                        "repeats {}",
+                        key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_content_edge,
+                        fmv_block_count, vulkan_texture.video_frame_boundary_repeats());
+          }
+        }
+      }
       // Fully rewritten plane: upload and make it the new baseline.
       fmv_baseline_refresh = true;
     } else if (fmv_tail_zero) {
@@ -1604,6 +1680,20 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
       }
       if (fmv_static_zero_top) {
         fmv_baseline_refresh = true;
+        if (REXCVAR_GET(fh1_fmv_debug) && fmv_changed_high == 0) {
+          // Detector: a prefix change with a zero tail is the intended
+          // letterbox/fade upload; a burst of these during visible flicker
+          // would point at a classification hole instead.
+          static std::atomic<uint32_t> fmv_prefix_uploads{0};
+          const uint32_t fmv_prefix_upload =
+              fmv_prefix_uploads.fetch_add(1, std::memory_order_relaxed);
+          if (fmv_prefix_upload % 32 == 0) {
+            REXGPU_INFO("fh1 fmv prefix upload with zero tail: {:08X} {}x{} bytes {} zero "
+                        "chunks {}/{}",
+                        key.base_page << 12, key.GetWidth(), key.GetHeight(), size_bytes,
+                        fmv_zero_chunks, kFmvChunkCount);
+          }
+        }
       } else {
         // Same boundary-repeat escape as the non-zero-tail branch below: a
         // band that sits at the same block for several consecutive
@@ -1617,6 +1707,16 @@ bool VulkanTextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_b
         if (!fmv_band_moved &&
             vulkan_texture.video_frame_boundary_repeats() >= kFmvBoundaryRepeatUpload) {
           fmv_baseline_refresh = true;
+          if (REXCVAR_GET(fh1_fmv_debug)) {
+            static std::atomic<uint32_t> fmv_zero_tail_escapes{0};
+            const uint32_t fmv_zero_tail_escape =
+                fmv_zero_tail_escapes.fetch_add(1, std::memory_order_relaxed);
+            if (fmv_zero_tail_escape % 8 == 0) {
+              REXGPU_INFO("fh1 fmv zero-tail boundary-escape upload: {:08X} {}x{} band {}/{}",
+                          key.base_page << 12, key.GetWidth(), key.GetHeight(), fmv_changed_high,
+                          fmv_changed_low);
+            }
+          }
         } else {
           vulkan_texture.MarkAsUsed();
           static std::atomic<uint32_t> fmv_retained_zero_tail_frames{0};

@@ -774,6 +774,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
+  // Draws skipped in the current frame because their pipeline was still
+  // compiling (vulkan_frame_stats reports it with the frame summary).
+  uint32_t frame_async_placeholder_draws_ = 0;
+  // Submission and draw counters at frame open, so the per-frame summary
+  // (vulkan_frame_stats) can report the frame's own counts.
+  uint64_t frame_first_submission_ = 0;
+  uint64_t frame_first_draw_index_ = 0;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

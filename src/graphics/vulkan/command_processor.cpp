@@ -128,6 +128,11 @@ REXCVAR_DEFINE_BOOL(vulkan_breadcrumbs, REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "the last work the GPU confirmed and the pending suspects; used when "
                     "VK_NV_device_diagnostic_checkpoints is unavailable (Turnip/Mesa)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_frame_stats, false, "GPU/Vulkan",
+                    "Log one line per presented guest frame with its draw, submission and "
+                    "placeholder-pipeline counts, and a WARN for every draw skipped while "
+                    "its pipeline is still compiling (which pipeline, which shaders)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -2790,12 +2795,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
-    static bool skipped_incomplete_frame_logged = false;
-    if (!skipped_incomplete_frame_logged) {
-      skipped_incomplete_frame_logged = true;
+    static std::atomic<uint32_t> skipped_incomplete_frames{0};
+    const uint32_t skipped_incomplete_total =
+        skipped_incomplete_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (skipped_incomplete_total <= 4 || skipped_incomplete_total % 16 == 0) {
       REXGPU_WARN(
           "Skipping Vulkan frame presentation due to async placeholder draw "
-          "usage in this frame");
+          "usage in this frame (frame {}, {} placeholder draws, {} frames skipped "
+          "so far)",
+          frame_current_, frame_async_placeholder_draws_, skipped_incomplete_total);
     }
     EndSubmission(true);
     return;
@@ -4731,6 +4739,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                                 &pipeline_is_placeholder);
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
+    frame_async_placeholder_draws_++;
+    if (REXCVAR_GET(vulkan_frame_stats)) {
+      // Which pipeline is still warming: the guest pipeline handle and the
+      // vertex/pixel ucode hashes identify the permutation, so the log
+      // points at the shader the device spent its compile budget on.
+      REXGPU_WARN(
+          "draw skipped, pipeline still warming (frame {}, draw {}, handle {:016X}, "
+          "vs {:016X}, ps {:016X})",
+          frame_current_, debug_frame_draw_index_, uint64_t(uintptr_t(pipeline_handle)),
+          vertex_shader->ucode_data_hash(),
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    }
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
@@ -5917,6 +5937,12 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (fence_status != VK_SUCCESS) {
       if (fence_status == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
+      } else if (fence_status != VK_NOT_READY) {
+        // A zero-timeout poll reports an unsignaled fence as VK_NOT_READY;
+        // anything else is a real error the submission completion path
+        // previously swallowed silently.
+        REXGPU_ERROR("Failed to poll submission completion Vulkan fence: VkResult {}",
+                     int32_t(fence_status));
       }
       break;
     }
@@ -6096,6 +6122,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
+    frame_async_placeholder_draws_ = 0;
+    frame_first_submission_ = GetCurrentSubmission();
+    frame_first_draw_index_ = debug_frame_draw_index_;
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -6370,6 +6399,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
     LogMemoryBudget();
+    if (REXCVAR_GET(vulkan_frame_stats)) {
+      // frame_current_ was just incremented above; the closed frame is one
+      // less.
+      REXGPU_INFO("vulkan frame {} closed: {} draws, {} submissions, {} placeholder draws",
+                  frame_current_ - 1, debug_frame_draw_index_ - frame_first_draw_index_,
+                  GetCurrentSubmission() - frame_first_submission_,
+                  frame_async_placeholder_draws_);
+    }
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

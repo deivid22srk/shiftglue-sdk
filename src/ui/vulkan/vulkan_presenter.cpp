@@ -1667,6 +1667,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 
   SetPaintedGuestOutputRect(nullptr);
+  if (!guest_output_image) {
+    // No guest output to paint: the swapchain image renders as the clear
+    // color (black). Normal only before the first frame; mid-game this is a
+    // black frame presented to the player - the flicker detector.
+    static std::atomic<uint32_t> blank_painted_frames{0};
+    const uint32_t blank_painted_total =
+        blank_painted_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (blank_painted_total <= 4 || blank_painted_total % 16 == 0) {
+      REXLOG_WARN(
+          "VulkanPresenter: presenting a clear-only frame, no guest output "
+          "available ({} so far)",
+          blank_painted_total);
+    }
+  }
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
@@ -2284,8 +2298,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   if (present_id > 1 && (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
     // At most one present in flight: the previous one must have reached the
     // display before the next frame is painted.
-    dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain, present_id - 1,
-                            UINT64_C(50000000));
+    VkResult present_wait_result = dfn.vkWaitForPresentKHR(
+        vulkan_device_->device(), paint_context_.swapchain, present_id - 1,
+        UINT64_C(50000000));
+    if (present_wait_result != VK_SUCCESS && present_wait_result != VK_TIMEOUT) {
+      REXLOG_WARN("VulkanPresenter: vkWaitForPresentKHR returned VkResult {}",
+                  int32_t(present_wait_result));
+    }
   }
   switch (present_result) {
     case VK_SUCCESS:
