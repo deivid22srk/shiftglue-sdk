@@ -62,6 +62,22 @@ REXCVAR_DEFINE_BOOL(fh1_fmv_retain, true, "GPU/Vulkan",
                     "CPU fast path snapshots a torn mid-rewrite plane (the decoder rewrites "
                     "it top to bottom); false restores always uploading every snapshot")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// On by default on Android (session 20261009 investigation): mips-only loads of
+// tiled textures exercise the per-level guest offset path of the load compute
+// shader (mip_offsets_bytes relative to the mip page), where Turnip vs desktop
+// divergence is plausible - the last GPU operation confirmed before the Turnip
+// device loss in that session was a mips-only tiled load (crash.log marker
+// #3328680), and LOD-dependent texture corruption (green grid / checkerboard /
+// tearing) was visible in gameplay. Coalescing turns every mips-only reload of
+// a tiled texture into a full base+mips upload, so the load always starts from
+// the base level and the suspect path is never taken. Desktop keeps the
+// well-tested mips-only path.
+REXCVAR_DEFINE_BOOL(vulkan_texture_load_coalesce_mips, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Load the base level together with the mips on every mips-only reload of a "
+                    "tiled texture (avoiding mips-only tiled loads, the suspect path for "
+                    "Turnip-specific corruption and device loss), instead of uploading only the "
+                    "requested mip range")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_texture_log, false, "GPU/Vulkan",
                     "Log one line per created texture: guest address, Xenos format, the host "
                     "format chosen for this device (and whether it is a fallback), tiling, "
@@ -1848,6 +1864,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                                                                  bool load_base, bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
+  // Coalesce mips-only loads of tiled textures into full base+mips uploads
+  // (see the vulkan_texture_load_coalesce_mips cvar description). Done before
+  // the checkpoint so breadcrumbs record the upload actually performed, and
+  // level_first below becomes 0, making the load take the base descriptor path
+  // shared with full loads.
+  if (REXCVAR_GET(vulkan_texture_load_coalesce_mips) && !load_base && load_mips &&
+      texture_key.tiled) {
+    load_base = true;
+    if (REXCVAR_GET(vulkan_texture_log)) {
+      REXGPU_INFO("texture load coalesced to base+mips: {:08X} tiled {}x{} mips {}",
+                  texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+                  uint32_t(texture_key.mip_max_level) + 1);
+    }
+  }
   if (command_processor_.recording_checkpoints()) {
     command_processor_.Checkpoint(
         VulkanCommandProcessor::CheckpointKind::kTextureLoad, texture_key.base_page,
