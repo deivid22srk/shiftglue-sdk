@@ -486,6 +486,11 @@ class VulkanPipelineCache {
   std::priority_queue<PipelineCreationArguments, std::vector<PipelineCreationArguments>,
                       PipelineCreationArgumentsPriorityComparator>
       creation_queue_;
+  // Pipelines beyond the vulkan_pipeline_creation_burst limit, FIFO. Kept
+  // separate from creation_queue_ so the priority queue (draw-visible priority)
+  // keeps working within the burst; the workers take from here once the burst
+  // has drained.
+  std::deque<PipelineCreationArguments> creation_overflow_queue_;
   size_t creation_threads_busy_ = 0;
   bool startup_loading_ = false;
   std::unique_ptr<rex::thread::Event> creation_completion_event_;

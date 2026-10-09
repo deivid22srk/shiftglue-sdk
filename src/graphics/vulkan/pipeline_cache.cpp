@@ -68,15 +68,26 @@ REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, 
                     "tens of milliseconds to compile, and building a placeholder and then waiting "
                     "for the real one at every submission froze new scenes for seconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, 200, "GPU/Vulkan",
+REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 500 : 200, "GPU/Vulkan",
                      "With vulkan_async_pipeline_no_placeholder, how long a draw whose pipeline is "
                      "still being built waits on the GPU commands thread for the worker before the "
                      "draw is skipped instead (0 waits not at all). Waiting keeps render target "
                      "contents consistent - a skipped draw leaves the targets holding whatever a "
                      "previous use of the same EDRAM tiles contained, which a later frame can "
                      "present as stale or flickering image parts (intro videos, roads) while "
-                     "pipelines are warming up")
+                     "pipelines are warming up. 500 ms on Android (session 20261009: 48 frames "
+                     "were skipped in bursts during the intro, perceived as prolonged black "
+                     "screens - trading a bounded wait for skipped-frame avoidance)")
     .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(vulkan_pipeline_creation_burst, 64, "GPU/Vulkan",
+                     "Maximum number of graphics pipelines queued for async creation or being "
+                     "built by the workers at once; draws whose pipelines don't fit the burst are "
+                     "skipped without growing the backlog until it drains (0 = unlimited). "
+                     "Bounds the driver-side cost of a pipeline creation storm (session "
+                     "20261009: a frame with 224 placeholder draws was immediately followed by a "
+                     "Turnip GPU fault)")
+    .range(0, 4096)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
@@ -964,6 +975,7 @@ void VulkanPipelineCache::Shutdown() {
     while (!creation_queue_.empty()) {
       creation_queue_.pop();
     }
+    creation_overflow_queue_.clear();
     creation_threads_busy_ = 0;
     startup_loading_ = false;
     creation_completion_set_event_ = false;
@@ -1376,7 +1388,21 @@ bool VulkanPipelineCache::ConfigurePipeline(
     pipeline.second.is_placeholder.store(true, std::memory_order_release);
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
-      creation_queue_.push(creation_arguments_real);
+      // Limit the compile backlog (vulkan_pipeline_creation_burst): a frame can
+      // request over two hundred new pipelines at once (new scene, new effects)
+      // - queueing all of them for immediate creation stresses the driver
+      // concurrent with rendering, which preceded a Turnip device loss in the
+      // session 20261009 logs. Beyond the limit, pipelines wait in the overflow
+      // for the burst to drain, while their draws are skipped the same way as
+      // for any other still-building pipeline.
+      int32_t creation_burst = REXCVAR_GET(vulkan_pipeline_creation_burst);
+      if (creation_burst > 0 &&
+          creation_queue_.size() + creation_overflow_queue_.size() + creation_threads_busy_ >=
+              size_t(creation_burst)) {
+        creation_overflow_queue_.push_back(creation_arguments_real);
+      } else {
+        creation_queue_.push(creation_arguments_real);
+      }
     }
     creation_request_cond_.notify_one();
     if (pipeline_storage_file_) {
@@ -3896,19 +3922,38 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
     PipelineCreationArguments creation_arguments;
     {
       std::unique_lock<std::mutex> lock(creation_request_lock_);
-      if (thread_index >= creation_threads_shutdown_from_ || creation_queue_.empty()) {
+      for (;;) {
+        if (thread_index >= creation_threads_shutdown_from_) {
+          if (creation_completion_set_event_ && creation_threads_busy_ == 0) {
+            creation_completion_set_event_ = false;
+            creation_completion_event_->Set();
+          }
+          return;
+        }
+        if (!creation_queue_.empty()) {
+          creation_arguments = creation_queue_.top();
+          creation_queue_.pop();
+          break;
+        }
+        // Main queue drained: take from the overflow, but only within the
+        // creation burst limit (vulkan_pipeline_creation_burst) - this thread
+        // is about to become one of the in-flight creations counted there.
+        int32_t creation_burst = REXCVAR_GET(vulkan_pipeline_creation_burst);
+        bool within_creation_burst =
+            creation_burst <= 0 ||
+            creation_queue_.size() + creation_overflow_queue_.size() + creation_threads_busy_ <
+                size_t(creation_burst);
+        if (!creation_overflow_queue_.empty() && within_creation_burst) {
+          creation_arguments = creation_overflow_queue_.front();
+          creation_overflow_queue_.pop_front();
+          break;
+        }
         if (creation_completion_set_event_ && creation_threads_busy_ == 0) {
           creation_completion_set_event_ = false;
           creation_completion_event_->Set();
         }
-        if (thread_index >= creation_threads_shutdown_from_) {
-          return;
-        }
         creation_request_cond_.wait(lock);
-        continue;
       }
-      creation_arguments = creation_queue_.top();
-      creation_queue_.pop();
       ++creation_threads_busy_;
     }
 
