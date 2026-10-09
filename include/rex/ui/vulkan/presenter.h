@@ -475,6 +475,17 @@ class VulkanPresenter final : public Presenter {
   std::array<GuestOutputImageInstance, kGuestOutputMailboxSize> guest_output_images_;
   VulkanSubmissionTracker guest_output_image_refresher_submission_tracker_;
 
+  // The last guest output image consumed while it was active, with the
+  // properties it was published with. Kept for re-presentation when the mailbox
+  // later has no active image (for example, when the guest publishes a blank
+  // output between its rendering phases, or while guest frames are being
+  // skipped): the last valid frame is presented again (video-player behavior)
+  // instead of a clear-only black one. Painting is serialized between threads,
+  // and the shared pointer keeps the image alive on top of the paint
+  // references, so no additional synchronization is needed.
+  std::shared_ptr<GuestOutputImage> last_painted_guest_output_image_;
+  GuestOutputProperties last_painted_guest_output_properties_;
+
   // UI submission tracker with the submission index that can be given to UI
   // drawers (accessible from the UI thread only, at any time).
   VulkanSubmissionTracker ui_submission_tracker_;

@@ -1659,6 +1659,28 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     if (guest_output_mailbox_index != UINT32_MAX) {
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+      // Remember the last valid guest output for re-presentation below.
+      last_painted_guest_output_image_ = guest_output_image;
+      last_painted_guest_output_properties_ = guest_output_properties;
+    } else if (last_painted_guest_output_image_) {
+      // No active guest output in the mailbox (for example, the guest has
+      // published a blank output between its rendering phases, or all its
+      // recent frames were skipped due to async pipeline creation). Present
+      // the last valid frame again rather than a clear-only black one, as
+      // long as an active guest output has been painted at least once since
+      // the start - a mid-game black frame is a flicker for the player.
+      guest_output_image = last_painted_guest_output_image_;
+      guest_output_properties = last_painted_guest_output_properties_;
+      static std::atomic<uint32_t> last_output_repainted_frames{0};
+      const uint32_t last_output_repainted_total =
+          last_output_repainted_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (last_output_repainted_total <= 4 || last_output_repainted_total % 32 == 0) {
+        REXLOG_INFO(
+            "VulkanPresenter: no active guest output, re-presenting the last "
+            "painted one ({}x{}, {} so far)",
+            guest_output_properties.frontbuffer_width,
+            guest_output_properties.frontbuffer_height, last_output_repainted_total);
+      }
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
