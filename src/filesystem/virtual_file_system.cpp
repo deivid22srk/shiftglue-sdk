@@ -13,6 +13,10 @@
 #include <rex/logging.h>
 #include <rex/string.h>
 
+#include <mutex>
+#include <string>
+#include <unordered_set>
+
 #include <rex/filesystem/devices/host_path_entry.h>
 
 REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
@@ -154,6 +158,34 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
                   entry->absolute_path());
     }
   } else {
+    // Colour-grading LUTs missing from the disc copy grade with empty input
+    // (blown highlights, near-black panels) and the title probes them without
+    // going through NtCreateFile, so they would otherwise only ever show as
+    // this debug line (session 20261009: Media\tracks\Colorado\
+    // colorgradinglookup00.dds hid here at 17:23:14). Warn once per path.
+    {
+      static std::mutex grading_warn_mutex;
+      static std::unordered_set<std::string> grading_warned;
+      std::string lower_path(path);
+      for (char& c : lower_path) {
+        c = c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c;
+      }
+      if (lower_path.find("colorgradinglookup") != std::string::npos ||
+          lower_path.find("colourgradingmaps") != std::string::npos) {
+        bool warn_now = false;
+        {
+          std::lock_guard<std::mutex> lock(grading_warn_mutex);
+          warn_now = grading_warned.insert(std::string(path)).second;
+        }
+        if (warn_now) {
+          REXFS_WARN(
+              "colour grading LUT missing: '{}' (grading renders with broken "
+              "exposure/bloom; re-copy Media/tracks and "
+              "media/dynamicpost/colourgradingmaps from the disc extraction)",
+              path);
+        }
+      }
+    }
     if (had_symlink) {
       REXFS_DEBUG("VFS: entry not found for '{}' (via symlink '{}') on device '{}'", path,
                   normalized_path, device->mount_path());
