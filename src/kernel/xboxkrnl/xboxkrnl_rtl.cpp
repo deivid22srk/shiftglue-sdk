@@ -394,9 +394,13 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   // Spin loop
   while (spin_count--) {
-    // std::atomic_ref is unavailable on the Android NDK's libc++; the plain
-    // __atomic builtin covers every target with guest-memory semantics.
-    if (__atomic_load_n(&cs->lock_count, __ATOMIC_RELAXED) != -1) {
+    // std::atomic_ref is unavailable on the Android NDK's libc++, and
+    // __atomic_load_n on guest-mapped memory (whose alignment the compiler
+    // cannot prove) emits a libatomic call that has no Windows
+    // implementation. A volatile load re-reads the word on every spin with
+    // the same relaxed semantics; the compare-exchange below stays the
+    // synchronization point.
+    if (*reinterpret_cast<volatile int32_t*>(&cs->lock_count) != -1) {
       rex::thread::SpinPause();
       continue;
     }
