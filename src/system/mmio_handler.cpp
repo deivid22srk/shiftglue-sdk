@@ -13,15 +13,17 @@
 #include <cstring>
 #include <utility>
 
-// dladdr is available on every platform this file builds for (Linux, Android,
-// macOS).
-#include <dlfcn.h>
-
 #include <rex/assert.h>
 #include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
+// dladdr is available on every POSIX platform this file builds for (Linux,
+// Android, macOS). Windows has no dlfcn; the unhandled-fault logs there carry
+// the bare host PC instead of a library and offset.
+#if !REX_PLATFORM_WIN32
+#include <dlfcn.h>
+#endif
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
@@ -374,17 +376,19 @@ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
 
 void MMIOHandler::LogUnhandledFault(arch::Exception* ex, const char* reason) {
   const auto pc = reinterpret_cast<uintptr_t>(ex->pc());
+#if !REX_PLATFORM_WIN32
   Dl_info info = {};
   if (dladdr(reinterpret_cast<const void*>(pc), &info) && info.dli_fname) {
     REXSYS_ERROR(
         "Unhandled fault ({}): address 0x{:X}, guest memory 0x{:X}..0x{:X}, PC {} +0x{:X}",
         reason, ex->fault_address(), uint64_t(virtual_membase_), uint64_t(memory_end_),
         info.dli_fname, pc - reinterpret_cast<uintptr_t>(info.dli_fbase));
-  } else {
-    REXSYS_ERROR("Unhandled fault ({}): address 0x{:X}, guest memory 0x{:X}..0x{:X}, PC 0x{:X}",
-                 reason, ex->fault_address(), uint64_t(virtual_membase_), uint64_t(memory_end_),
-                 pc);
+    return;
   }
+#endif
+  REXSYS_ERROR("Unhandled fault ({}): address 0x{:X}, guest memory 0x{:X}..0x{:X}, PC 0x{:X}",
+               reason, ex->fault_address(), uint64_t(virtual_membase_), uint64_t(memory_end_),
+               pc);
 }
 
 bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
